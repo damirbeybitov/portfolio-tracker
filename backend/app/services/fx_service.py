@@ -1,0 +1,85 @@
+from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy import select, desc
+from datetime import date
+from decimal import Decimal
+from typing import Optional
+import yfinance as yf
+import asyncio
+import logging
+
+from app.models.bank import FxRate
+
+logger = logging.getLogger(__name__)
+
+
+class FxService:
+
+    @staticmethod
+    async def get_rate(db: AsyncSession, target_date: Optional[date] = None) -> Decimal:
+        """
+        Get USD/KZT rate for a given date.
+        Falls back to most recent stored rate, then fetches from Yahoo Finance.
+        """
+        if target_date is None:
+            target_date = date.today()
+
+        # Try exact date from DB
+        result = await db.execute(
+            select(FxRate).where(FxRate.date == target_date)
+        )
+        fx = result.scalar_one_or_none()
+        if fx:
+            return fx.usd_to_kzt
+
+        # Try fetching from market
+        rate = await FxService._fetch_usd_kzt()
+        if rate:
+            fx = FxRate(date=target_date, usd_to_kzt=Decimal(str(rate)), source="api")
+            db.add(fx)
+            await db.flush()
+            return Decimal(str(rate))
+
+        # Fall back to latest stored rate
+        result = await db.execute(
+            select(FxRate).order_by(desc(FxRate.date)).limit(1)
+        )
+        fx = result.scalar_one_or_none()
+        if fx:
+            return fx.usd_to_kzt
+
+        # Hard fallback
+        return Decimal("450.00")
+
+    @staticmethod
+    async def _fetch_usd_kzt() -> Optional[float]:
+        try:
+            loop = asyncio.get_event_loop()
+            return await loop.run_in_executor(None, FxService._do_fetch)
+        except Exception as e:
+            logger.warning(f"FX fetch failed: {e}")
+            return None
+
+    @staticmethod
+    def _do_fetch() -> Optional[float]:
+        t = yf.Ticker("USDKZT=X")
+        info = t.fast_info
+        price = getattr(info, "last_price", None)
+        if not price:
+            hist = t.history(period="2d")
+            if not hist.empty:
+                price = float(hist["Close"].iloc[-1])
+        return float(price) if price else None
+
+    @staticmethod
+    async def set_manual_rate(db: AsyncSession, target_date: date, rate: Decimal) -> FxRate:
+        """Manually set or override an exchange rate for a date."""
+        result = await db.execute(select(FxRate).where(FxRate.date == target_date))
+        fx = result.scalar_one_or_none()
+        if fx:
+            fx.usd_to_kzt = rate
+            fx.source = "manual"
+        else:
+            fx = FxRate(date=target_date, usd_to_kzt=rate, source="manual")
+            db.add(fx)
+        await db.flush()
+        return fx
