@@ -12,9 +12,9 @@ services:
     volumes:
       - postgres_data:/var/lib/postgresql/data
     ports:
-      - "5432:5432"
+      - "5430:5432"
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-portfolio}"]
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-portfolio} -d ${POSTGRES_DB:-portfolio_tracker}"]
       interval: 10s
       timeout: 5s
       retries: 5
@@ -50,7 +50,6 @@ services:
       - /app/node_modules
     environment:
       - NODE_ENV=development
-    command: ng serve --host 0.0.0.0 --port 4200 --poll 2000
 
 volumes:
   postgres_data:
