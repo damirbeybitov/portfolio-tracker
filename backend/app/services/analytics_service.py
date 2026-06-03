@@ -1,3 +1,6 @@
+import logging
+import asyncio
+import time
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select, and_, func
 from decimal import Decimal
@@ -10,16 +13,23 @@ from app.schemas.analytics import PeriodPnl, PortfolioAnalytics, BankSummary, Ov
 from app.services.price_service import PriceService
 from app.services.fx_service import FxService
 
+logger = logging.getLogger("app.services.analytics")
+
 
 class AnalyticsService:
 
     @staticmethod
-    async def get_portfolio_analytics(db: AsyncSession, user_id: int, portfolio_id: int) -> PortfolioAnalytics:
+    async def get_portfolio_analytics(
+        db: AsyncSession, user_id: int, portfolio_id: int,
+    ) -> PortfolioAnalytics:
         from fastapi import HTTPException
+        t0 = time.perf_counter()
+
         result = await db.execute(
             select(Portfolio).where(and_(Portfolio.id == portfolio_id, Portfolio.user_id == user_id))
         )
         if not result.scalar_one_or_none():
+            logger.warning("Analytics requested for unknown portfolio", extra={"user_id": user_id, "portfolio_id": portfolio_id})
             raise HTTPException(status_code=404, detail="Portfolio not found")
 
         fx_rate = await FxService.get_rate(db)
@@ -29,6 +39,7 @@ class AnalyticsService:
         positions = result.scalars().all()
 
         if not positions:
+            logger.info("Analytics: no positions in portfolio", extra={"portfolio_id": portfolio_id})
             empty = PeriodPnl(period="1D", profit_usd=zero, profit_kzt=zero,
                               profit_percent=zero, value_start_usd=zero, value_end_usd=zero)
             return PortfolioAnalytics(
@@ -78,12 +89,25 @@ class AnalyticsService:
         total_profit_usd = total_value_usd - total_invested_usd
         total_profit_pct = (total_profit_usd / total_invested_usd * 100) if total_invested_usd else zero
 
-        import asyncio
         pnl_tasks = [
             AnalyticsService._calc_period_pnl(db, positions, securities, current_prices, fx_rate, days, key)
             for key, days in [("1D", 1), ("1W", 7), ("1M", 30), ("1Y", 365)]
         ]
         pnl_1d, pnl_1w, pnl_1m, pnl_1y = await asyncio.gather(*pnl_tasks)
+
+        elapsed_ms = (time.perf_counter() - t0) * 1000
+        logger.info(
+            "Portfolio analytics computed",
+            extra={
+                "portfolio_id": portfolio_id,
+                "positions": len(positions_profit),
+                "total_value_usd": float(total_value_usd),
+                "total_profit_usd": float(total_profit_usd),
+                "pnl_1d": float(pnl_1d.profit_usd),
+                "pnl_1m": float(pnl_1m.profit_usd),
+                "duration_ms": round(elapsed_ms, 1),
+            },
+        )
 
         return PortfolioAnalytics(
             total_value_usd=total_value_usd,
@@ -99,7 +123,6 @@ class AnalyticsService:
 
     @staticmethod
     async def _calc_period_pnl(db, positions, securities, current_prices, fx_rate, days, period_key):
-        import asyncio
         zero = Decimal("0")
         start_date = date.today() - timedelta(days=days)
 
@@ -129,6 +152,15 @@ class AnalyticsService:
 
         profit = value_end - value_start
         profit_pct = (profit / value_start * 100) if value_start else zero
+        logger.debug(
+            "Period PnL computed",
+            extra={
+                "period": period_key,
+                "value_start": float(value_start),
+                "value_end": float(value_end),
+                "profit_usd": float(profit),
+            },
+        )
         return PeriodPnl(
             period=period_key, profit_usd=profit, profit_kzt=profit * fx_rate,
             profit_percent=profit_pct, value_start_usd=value_start, value_end_usd=value_end,
@@ -177,6 +209,11 @@ class AnalyticsService:
                 "interest_earned": float(interest_earned),
             })
 
+        logger.debug(
+            "Bank summary computed",
+            extra={"user_id": user_id, "accounts": len(accounts), "total_kzt": float(total_kzt), "total_usd": float(total_usd)},
+        )
+
         return BankSummary(
             total_kzt=total_kzt,
             total_usd=total_usd,
@@ -192,6 +229,15 @@ class AnalyticsService:
         portfolio_analytics = await AnalyticsService.get_portfolio_analytics(db, user_id, portfolio_id)
         bank_summary = await AnalyticsService.get_bank_summary(db, user_id)
         grand_total_usd = portfolio_analytics.total_value_usd + bank_summary.total_usd_equivalent
+        logger.info(
+            "Overall summary computed",
+            extra={
+                "user_id": user_id,
+                "portfolio_id": portfolio_id,
+                "grand_total_usd": float(grand_total_usd),
+                "fx_rate": float(fx_rate),
+            },
+        )
         return OverallSummary(
             portfolio=portfolio_analytics,
             bank=bank_summary,

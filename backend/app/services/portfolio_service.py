@@ -1,8 +1,10 @@
+import logging
+from decimal import Decimal
+from datetime import date
+
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select, and_, delete
 from fastapi import HTTPException, status
-from decimal import Decimal
-from datetime import date
 
 from app.models.portfolio import Portfolio, Security, Position
 from app.models.transaction import Transaction, TransactionType
@@ -14,6 +16,8 @@ from app.schemas.portfolio import (
 from app.services.price_service import PriceService
 from app.services.fx_service import FxService
 
+logger = logging.getLogger("app.services.portfolio")
+
 
 class PortfolioService:
 
@@ -21,16 +25,20 @@ class PortfolioService:
 
     @staticmethod
     async def create(db: AsyncSession, user_id: int, data: PortfolioCreate) -> PortfolioResponse:
+        logger.info("Creating portfolio", extra={"user_id": user_id, "portfolio_name": data.name})
         p = Portfolio(user_id=user_id, **data.model_dump())
         db.add(p)
         await db.flush()
         await db.refresh(p)
+        logger.info("Portfolio created", extra={"user_id": user_id, "portfolio_id": p.id})
         return PortfolioResponse.model_validate(p)
 
     @staticmethod
     async def list_portfolios(db: AsyncSession, user_id: int) -> list[PortfolioResponse]:
         result = await db.execute(select(Portfolio).where(Portfolio.user_id == user_id))
-        return [PortfolioResponse.model_validate(p) for p in result.scalars().all()]
+        portfolios = result.scalars().all()
+        logger.debug("Listed portfolios", extra={"user_id": user_id, "count": len(portfolios)})
+        return [PortfolioResponse.model_validate(p) for p in portfolios]
 
     @staticmethod
     async def get_or_404(db: AsyncSession, user_id: int, portfolio_id: int) -> Portfolio:
@@ -39,22 +47,32 @@ class PortfolioService:
         )
         p = result.scalar_one_or_none()
         if not p:
+            logger.warning(
+                "Portfolio not found",
+                extra={"user_id": user_id, "portfolio_id": portfolio_id},
+            )
             raise HTTPException(status_code=404, detail="Portfolio not found")
         return p
 
     @staticmethod
     async def update(db: AsyncSession, user_id: int, portfolio_id: int, data: PortfolioUpdate) -> PortfolioResponse:
         p = await PortfolioService.get_or_404(db, user_id, portfolio_id)
-        for field, value in data.model_dump(exclude_unset=True).items():
+        changes = data.model_dump(exclude_unset=True)
+        for field, value in changes.items():
             setattr(p, field, value)
         await db.flush()
         await db.refresh(p)
+        logger.info(
+            "Portfolio updated",
+            extra={"user_id": user_id, "portfolio_id": portfolio_id, "fields": list(changes.keys())},
+        )
         return PortfolioResponse.model_validate(p)
 
     @staticmethod
     async def delete(db: AsyncSession, user_id: int, portfolio_id: int) -> None:
         p = await PortfolioService.get_or_404(db, user_id, portfolio_id)
         await db.delete(p)
+        logger.info("Portfolio deleted", extra={"user_id": user_id, "portfolio_id": portfolio_id})
 
     # ── Securities ────────────────────────────────────────────────────────────
 
@@ -64,16 +82,20 @@ class PortfolioService:
         result = await db.execute(select(Security).where(Security.ticker == ticker))
         sec = result.scalar_one_or_none()
         if sec:
+            logger.debug("Security found in DB", extra={"ticker": ticker, "security_id": sec.id})
             return sec
 
+        logger.info("Security not in DB, fetching from Yahoo Finance", extra={"ticker": ticker})
         info = await PriceService.get_security_info(ticker)
         if not info:
+            logger.warning("Ticker not found on Yahoo Finance", extra={"ticker": ticker})
             raise HTTPException(status_code=422, detail=f"Ticker '{ticker}' not found")
 
         sec = Security(**info)
         db.add(sec)
         await db.flush()
         await db.refresh(sec)
+        logger.info("Security created", extra={"ticker": ticker, "security_id": sec.id, "name": sec.name})
         return sec
 
     @staticmethod
@@ -83,7 +105,9 @@ class PortfolioService:
                 Security.ticker.ilike(f"%{q}%") | Security.name.ilike(f"%{q}%")
             ).limit(20)
         )
-        return [SecurityResponse.model_validate(s) for s in result.scalars().all()]
+        items = result.scalars().all()
+        logger.debug("Security search", extra={"query": q, "results": len(items)})
+        return [SecurityResponse.model_validate(s) for s in items]
 
     # ── Transactions ──────────────────────────────────────────────────────────
 
@@ -96,6 +120,7 @@ class PortfolioService:
         result = await db.execute(select(Security).where(Security.id == data.security_id))
         security = result.scalar_one_or_none()
         if not security:
+            logger.warning("Security not found for transaction", extra={"security_id": data.security_id})
             raise HTTPException(status_code=404, detail="Security not found")
 
         fx_rate = data.fx_rate_usd_kzt or await FxService.get_rate(db, data.date)
@@ -103,6 +128,20 @@ class PortfolioService:
         total_usd = data.price_usd * data.quantity
         total_kzt = price_kzt * data.quantity
         commission_kzt = data.commission_usd * fx_rate
+
+        logger.info(
+            "Adding transaction",
+            extra={
+                "user_id": user_id,
+                "portfolio_id": portfolio_id,
+                "ticker": security.ticker,
+                "type": data.type,
+                "quantity": float(data.quantity),
+                "price_usd": float(data.price_usd),
+                "total_usd": float(total_usd),
+                "fx_rate": float(fx_rate),
+            },
+        )
 
         tx = Transaction(
             portfolio_id=portfolio_id,
@@ -125,7 +164,7 @@ class PortfolioService:
 
         await PortfolioService._update_position(db, portfolio_id, security, tx, fx_rate)
         await db.refresh(tx)
-
+        logger.info("Transaction recorded", extra={"transaction_id": tx.id, "ticker": security.ticker})
         return await PortfolioService._tx_to_response(db, tx)
 
     @staticmethod
@@ -149,13 +188,24 @@ class PortfolioService:
 
         if tx.type == TransactionType.SPLIT:
             if pos and tx.split_ratio:
+                old_qty = float(pos.quantity)
                 pos.quantity = pos.quantity * tx.split_ratio
                 if tx.split_ratio > 0:
                     pos.avg_cost_usd = pos.avg_cost_usd / tx.split_ratio
                     pos.avg_cost_kzt = pos.avg_cost_kzt / tx.split_ratio
+                logger.info(
+                    "Split applied",
+                    extra={
+                        "ticker": security.ticker,
+                        "ratio": float(tx.split_ratio),
+                        "qty_before": old_qty,
+                        "qty_after": float(pos.quantity),
+                    },
+                )
             return
 
         if tx.type in (TransactionType.DIVIDEND, TransactionType.TAX, TransactionType.COMMISSION):
+            logger.debug("Non-position transaction recorded", extra={"type": tx.type, "ticker": security.ticker})
             return
 
         if tx.type == TransactionType.BUY:
@@ -173,6 +223,10 @@ class PortfolioService:
                     total_invested_kzt=cost_kzt,
                 )
                 db.add(pos)
+                logger.info(
+                    "New position opened",
+                    extra={"ticker": security.ticker, "quantity": float(tx.quantity), "cost_usd": float(cost_usd)},
+                )
             else:
                 new_qty = pos.quantity + tx.quantity
                 pos.total_invested_usd += cost_usd
@@ -180,19 +234,34 @@ class PortfolioService:
                 pos.avg_cost_usd = pos.total_invested_usd / new_qty
                 pos.avg_cost_kzt = pos.total_invested_kzt / new_qty
                 pos.quantity = new_qty
+                logger.info(
+                    "Position increased",
+                    extra={"ticker": security.ticker, "new_qty": float(new_qty), "avg_cost_usd": float(pos.avg_cost_usd)},
+                )
 
         elif tx.type == TransactionType.SELL:
             if pos is None or pos.quantity < tx.quantity:
+                avail = float(pos.quantity) if pos else 0
+                logger.warning(
+                    "Insufficient shares for sell",
+                    extra={"ticker": security.ticker, "available": avail, "requested": float(tx.quantity)},
+                )
                 raise HTTPException(
                     status_code=422,
-                    detail=f"Insufficient shares: have {pos.quantity if pos else 0}, selling {tx.quantity}",
+                    detail=f"Insufficient shares: have {avail}, selling {tx.quantity}",
                 )
             ratio = tx.quantity / pos.quantity
             pos.total_invested_usd -= pos.total_invested_usd * ratio
             pos.total_invested_kzt -= pos.total_invested_kzt * ratio
             pos.quantity -= tx.quantity
             if pos.quantity <= 0:
+                logger.info("Position fully closed", extra={"ticker": security.ticker})
                 await db.delete(pos)
+            else:
+                logger.info(
+                    "Position reduced",
+                    extra={"ticker": security.ticker, "remaining_qty": float(pos.quantity)},
+                )
 
         await db.flush()
 
@@ -208,8 +277,8 @@ class PortfolioService:
             .order_by(Transaction.date.desc(), Transaction.created_at.desc())
         )
         txs = result.scalars().all()
+        logger.debug("Listed transactions", extra={"portfolio_id": portfolio_id, "count": len(txs)})
 
-        # Fetch all securities in one query
         security_ids = list({tx.security_id for tx in txs})
         sec_result = await db.execute(select(Security).where(Security.id.in_(security_ids)))
         securities = {s.id: s for s in sec_result.scalars().all()}
@@ -225,16 +294,15 @@ class PortfolioService:
 
     @staticmethod
     async def get_summary(db: AsyncSession, user_id: int, portfolio_id: int) -> PortfolioSummary:
-        portfolio = await PortfolioService.get_or_404(db, user_id, portfolio_id)
+        import time
+        t0 = time.perf_counter()
 
-        result = await db.execute(
-            select(Position).where(Position.portfolio_id == portfolio_id)
-        )
+        portfolio = await PortfolioService.get_or_404(db, user_id, portfolio_id)
+        result = await db.execute(select(Position).where(Position.portfolio_id == portfolio_id))
         positions = result.scalars().all()
 
         fx_rate = await FxService.get_rate(db)
 
-        # Fetch securities in one query
         security_ids = [p.security_id for p in positions]
         securities = {}
         if security_ids:
@@ -243,6 +311,13 @@ class PortfolioService:
 
         tickers = [securities[p.security_id].ticker for p in positions if p.security_id in securities]
         prices = await PriceService.get_prices_batch(tickers) if tickers else {}
+
+        missing_prices = [t for t in tickers if prices.get(t) is None]
+        if missing_prices:
+            logger.warning(
+                "Could not fetch live prices for some tickers",
+                extra={"portfolio_id": portfolio_id, "tickers": missing_prices},
+            )
 
         enriched_positions = []
         total_value_usd = Decimal("0")
@@ -294,6 +369,19 @@ class PortfolioService:
         total_profit_kzt = total_profit_usd * fx_rate
         total_profit_pct = (
             (total_profit_usd / total_invested_usd * 100) if total_invested_usd else Decimal("0")
+        )
+
+        elapsed_ms = (time.perf_counter() - t0) * 1000
+        logger.info(
+            "Portfolio summary computed",
+            extra={
+                "portfolio_id": portfolio_id,
+                "positions": len(enriched_positions),
+                "total_value_usd": float(total_value_usd),
+                "total_profit_usd": float(total_profit_usd),
+                "fx_rate": float(fx_rate),
+                "duration_ms": round(elapsed_ms, 1),
+            },
         )
 
         return PortfolioSummary(
