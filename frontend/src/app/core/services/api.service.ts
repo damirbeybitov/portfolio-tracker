@@ -95,7 +95,7 @@ export class ApiService {
     return this.http.post<BankTransaction>(`${API}/bank/accounts/${accountId}/transactions`, data);
   }
   getFxRate(date?: string): Observable<FxRate> {
-    const params = date ? { target_date: date } : {};
+    const params = date ? new HttpParams().set('target_date', date) : new HttpParams();
     return this.http.get<FxRate>(`${API}/bank/fx`, { params });
   }
   setFxRate(data: { date: string; usd_to_kzt: number }): Observable<FxRate> {
