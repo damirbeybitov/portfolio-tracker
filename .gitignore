@@ -14,6 +14,7 @@ node_modules/
 dist/
 .angular/
 *.js.map
+package-lock.json
 
 # Database
 *.sql
