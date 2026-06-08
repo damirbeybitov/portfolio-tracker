@@ -187,9 +187,11 @@ class PortfolioService:
     async def _tx_to_response(db: AsyncSession, tx: Transaction) -> TransactionResponse:
         result = await db.execute(select(Security).where(Security.id == tx.security_id))
         security = result.scalar_one()
-        data = TransactionResponse.model_validate(tx)
-        data.security = SecurityResponse.model_validate(security)
-        return data
+        tx_data = {
+            **{c.name: getattr(tx, c.name) for c in tx.__table__.columns},
+            "security": SecurityResponse.model_validate(security),
+        }
+        return TransactionResponse.model_validate(tx_data)
 
     @staticmethod
     async def _update_position(
@@ -283,9 +285,11 @@ class PortfolioService:
 
         responses = []
         for tx in txs:
-            r = TransactionResponse.model_validate(tx)
-            r.security = SecurityResponse.model_validate(securities[tx.security_id])
-            responses.append(r)
+            tx_data = {
+                **{c.name: getattr(tx, c.name) for c in tx.__table__.columns},
+                "security": SecurityResponse.model_validate(securities[tx.security_id]),
+            }
+            responses.append(TransactionResponse.model_validate(tx_data))
         return responses
 
     # ── Portfolio Summary ─────────────────────────────────────────────────
