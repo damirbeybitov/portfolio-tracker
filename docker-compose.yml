@@ -19,6 +19,21 @@ services:
       timeout: 5s
       retries: 5
 
+  redis:
+    image: redis:7-alpine
+    container_name: portfolio_redis
+    restart: unless-stopped
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+    command: redis-server --appendonly yes --maxmemory 128mb --maxmemory-policy allkeys-lru
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
   backend:
     build:
       context: ./backend
@@ -28,12 +43,15 @@ services:
     env_file: .env
     environment:
       DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER:-portfolio}:${POSTGRES_PASSWORD:-portfolio_secret}@db:5432/${POSTGRES_DB:-portfolio_tracker}
+      REDIS_URL: redis://redis:6379/0
     ports:
       - "8000:8000"
     volumes:
       - ./backend:/app
     depends_on:
       db:
+        condition: service_healthy
+      redis:
         condition: service_healthy
     command: uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload
 
@@ -53,3 +71,4 @@ services:
 
 volumes:
   postgres_data:
+  redis_data:

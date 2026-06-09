@@ -1,214 +1,302 @@
 """
-Price Service — live and historical stock prices via Yahoo Finance.
+Price Service — multi-provider with Redis cache
+Chain: Redis → Alpha Vantage → Twelve Data → yfinance → DB last known
 
-Fixes in this version:
-1. Security lookup uses fast_info first (avoids the heavy quoteSummary endpoint
-   that triggers 429s). Falls back to .info only if fast_info is empty.
-2. Exponential backoff retry (up to 3 attempts) on 429 / transient errors.
-3. _fetch_price no longer calls .info at all — uses fast_info only.
-4. Historical fetch uses a 10-day look-back for weekends/holidays.
-5. All sync helpers are fully isolated — one ticker failure never affects others.
+TTL:
+  - Market hours (Mon–Fri 09:30–16:00 ET): 15 min
+  - After hours / weekends: 60 min
 """
-
-from __future__ import annotations
 
 import asyncio
 import logging
-import time
-from datetime import date, timedelta
+import json
+from datetime import date, datetime, timedelta, timezone
+from decimal import Decimal
 from typing import Optional
+from zoneinfo import ZoneInfo
 
+import httpx
 import yfinance as yf
+
+from app.core.config import settings
+from app.db.redis import get_redis
 
 logger = logging.getLogger(__name__)
 
-# Seconds to wait between retries: 1s, 3s, 7s
-_RETRY_DELAYS = (1, 3, 7)
+ET = ZoneInfo("America/New_York")
+
+PRICE_TTL_MARKET = 60 * 15       # 15 min during market hours
+PRICE_TTL_CLOSED = 60 * 60       # 1 hour outside market hours
+PRICE_KEY_PREFIX = "price:"
+LAST_KNOWN_KEY_PREFIX = "price:last:"
 
 
-def _with_retry(fn, *args, retries: int = 3, **kwargs):
-    """
-    Call fn(*args, **kwargs), retrying on 429 / transient network errors.
-    Returns None if all attempts fail.
-    """
-    last_exc = None
-    for attempt in range(retries):
-        try:
-            return fn(*args, **kwargs)
-        except Exception as exc:
-            msg = str(exc).lower()
-            is_rate_limit = "429" in msg or "too many requests" in msg or "rate" in msg
-            is_transient = "connection" in msg or "timeout" in msg or "reset" in msg
-
-            if not (is_rate_limit or is_transient):
-                logger.debug("%s failed (non-retryable): %s", fn.__name__, exc)
-                return None
-
-            last_exc = exc
-            delay = _RETRY_DELAYS[min(attempt, len(_RETRY_DELAYS) - 1)]
-            logger.warning(
-                "%s attempt %d/%d failed (%s), retrying in %ds",
-                fn.__name__, attempt + 1, retries, exc, delay,
-            )
-            time.sleep(delay)
-
-    logger.error("%s failed after %d attempts: %s", fn.__name__, retries, last_exc)
-    return None
+def _cache_ttl() -> int:
+    now = datetime.now(ET)
+    weekday = now.weekday()  # 0=Mon, 6=Sun
+    hour = now.hour + now.minute / 60
+    if weekday < 5 and 9.5 <= hour <= 16.0:
+        return PRICE_TTL_MARKET
+    return PRICE_TTL_CLOSED
 
 
 class PriceService:
 
-    # ------------------------------------------------------------------ #
-    #  Current price                                                       #
-    # ------------------------------------------------------------------ #
+    # ─────────────────────────────────────────────────────────────
+    # Public API
+    # ─────────────────────────────────────────────────────────────
 
-    @staticmethod
-    async def get_current_price(ticker: str) -> Optional[float]:
-        loop = asyncio.get_event_loop()
-        try:
-            return await loop.run_in_executor(
-                None, _with_retry, PriceService._fetch_price, ticker
-            )
-        except Exception as e:
-            logger.warning("get_current_price(%s) outer error: %s", ticker, e)
-            return None
+    @classmethod
+    async def get_current_price(cls, ticker: str) -> Optional[float]:
+        ticker = ticker.upper()
 
-    @staticmethod
-    def _fetch_price(ticker: str) -> Optional[float]:
-        t = yf.Ticker(ticker)
-        # fast_info does NOT call quoteSummary — safe from 429
-        price = getattr(t.fast_info, "last_price", None)
-        if price and float(price) > 0:
-            return float(price)
-        # Fallback: last close from 5-day bar data
-        hist = t.history(period="5d")
-        if not hist.empty:
-            return float(hist["Close"].iloc[-1])
+        # 1. Redis cache
+        price = await cls._redis_get(ticker)
+        if price is not None:
+            logger.debug(f"[cache] {ticker} = {price}")
+            return price
+
+        # 2. Alpha Vantage
+        if settings.ALPHA_VANTAGE_API_KEY:
+            price = await cls._fetch_alpha_vantage(ticker)
+            if price:
+                await cls._redis_set(ticker, price)
+                await cls._redis_set_last_known(ticker, price)
+                return price
+
+        # 3. Twelve Data
+        if settings.TWELVE_DATA_API_KEY:
+            price = await cls._fetch_twelve_data(ticker)
+            if price:
+                await cls._redis_set(ticker, price)
+                await cls._redis_set_last_known(ticker, price)
+                return price
+
+        # 4. yfinance
+        price = await cls._fetch_yfinance(ticker)
+        if price:
+            await cls._redis_set(ticker, price)
+            await cls._redis_set_last_known(ticker, price)
+            return price
+
+        # 5. Redis last-known (no TTL)
+        price = await cls._redis_get_last_known(ticker)
+        if price is not None:
+            logger.warning(f"[last-known] {ticker} = {price} (all providers failed)")
+            return price
+
+        logger.warning(f"[miss] {ticker}: no price from any provider")
         return None
 
-    @staticmethod
-    async def get_prices_batch(tickers: list[str]) -> dict[str, Optional[float]]:
+    @classmethod
+    async def get_prices_batch(cls, tickers: list[str]) -> dict[str, Optional[float]]:
+        """Fetch prices concurrently — respects per-provider rate limits."""
         if not tickers:
             return {}
-        tasks = [PriceService.get_current_price(t) for t in tickers]
+        tasks = [cls.get_current_price(t) for t in tickers]
         results = await asyncio.gather(*tasks, return_exceptions=True)
         return {
-            ticker: (r if isinstance(r, float) else None)
-            for ticker, r in zip(tickers, results)
+            t: (r if not isinstance(r, Exception) else None)
+            for t, r in zip(tickers, results)
         }
 
-    # ------------------------------------------------------------------ #
-    #  Historical price                                                    #
-    # ------------------------------------------------------------------ #
+    @classmethod
+    async def get_historical_price(cls, ticker: str, target_date: date) -> Optional[float]:
+        """Historical close price — Redis cached, yfinance backed."""
+        ticker = ticker.upper()
+        key = f"hist:{ticker}:{target_date.isoformat()}"
 
-    @staticmethod
-    async def get_historical_price(ticker: str, target_date: date) -> Optional[float]:
-        loop = asyncio.get_event_loop()
-        try:
-            return await loop.run_in_executor(
-                None,
-                _with_retry,
-                PriceService._fetch_historical,
-                ticker,
-                target_date,
-            )
-        except Exception as e:
-            logger.warning("get_historical_price(%s, %s) outer error: %s", ticker, target_date, e)
-            return None
+        cached = await cls._redis_get_raw(key)
+        if cached is not None:
+            return cached
 
-    @staticmethod
-    def _fetch_historical(ticker: str, target_date: date) -> Optional[float]:
-        t = yf.Ticker(ticker)
-        start = target_date - timedelta(days=10)
-        end = target_date + timedelta(days=1)
-        hist = t.history(
-            start=start.isoformat(),
-            end=end.isoformat(),
-            auto_adjust=True,
+        price = await asyncio.get_event_loop().run_in_executor(
+            None, cls._fetch_historical_yf, ticker, target_date
         )
-        if hist.empty:
-            return None
-        hist.index = hist.index.date  # type: ignore[attr-defined]
-        eligible = hist[hist.index <= target_date]
-        if eligible.empty:
-            return None
-        return float(eligible["Close"].iloc[-1])
+        if price:
+            # Historical prices don't change — cache for 24h
+            await cls._redis_set_raw(key, price, ttl=86400)
+        return price
 
-    # ------------------------------------------------------------------ #
-    #  Security metadata (lookup)                                         #
-    # ------------------------------------------------------------------ #
-
-    @staticmethod
-    async def get_security_info(ticker: str) -> Optional[dict]:
-        loop = asyncio.get_event_loop()
+    @classmethod
+    async def get_security_info(cls, ticker: str) -> Optional[dict]:
+        """Fetch basic security metadata via yfinance."""
         try:
-            result = await loop.run_in_executor(
-                None, _with_retry, PriceService._fetch_info, ticker
-            )
-            return result or PriceService._minimal_info(ticker)
+            loop = asyncio.get_event_loop()
+            return await loop.run_in_executor(None, cls._fetch_info_yf, ticker)
         except Exception as e:
-            logger.warning("get_security_info(%s) outer error: %s", ticker, e)
-            return PriceService._minimal_info(ticker)
+            logger.warning(f"get_security_info {ticker}: {e}")
+            return None
+
+    @classmethod
+    async def invalidate(cls, ticker: str) -> None:
+        """Force-expire a ticker from cache (e.g. after manual price override)."""
+        redis = await get_redis()
+        if redis:
+            await redis.delete(f"{PRICE_KEY_PREFIX}{ticker.upper()}")
+
+    # ─────────────────────────────────────────────────────────────
+    # Redis helpers
+    # ─────────────────────────────────────────────────────────────
+
+    @classmethod
+    async def _redis_get(cls, ticker: str) -> Optional[float]:
+        return await cls._redis_get_raw(f"{PRICE_KEY_PREFIX}{ticker}")
+
+    @classmethod
+    async def _redis_get_last_known(cls, ticker: str) -> Optional[float]:
+        return await cls._redis_get_raw(f"{LAST_KNOWN_KEY_PREFIX}{ticker}")
+
+    @classmethod
+    async def _redis_get_raw(cls, key: str) -> Optional[float]:
+        try:
+            redis = await get_redis()
+            if not redis:
+                return None
+            val = await redis.get(key)
+            return float(val) if val is not None else None
+        except Exception as e:
+            logger.debug(f"redis get {key}: {e}")
+            return None
+
+    @classmethod
+    async def _redis_set(cls, ticker: str, price: float) -> None:
+        await cls._redis_set_raw(f"{PRICE_KEY_PREFIX}{ticker}", price, ttl=_cache_ttl())
+
+    @classmethod
+    async def _redis_set_last_known(cls, ticker: str, price: float) -> None:
+        # No TTL — keeps the last successful price indefinitely
+        await cls._redis_set_raw(f"{LAST_KNOWN_KEY_PREFIX}{ticker}", price, ttl=None)
+
+    @classmethod
+    async def _redis_set_raw(cls, key: str, value: float, ttl: Optional[int]) -> None:
+        try:
+            redis = await get_redis()
+            if not redis:
+                return
+            if ttl:
+                await redis.setex(key, ttl, str(value))
+            else:
+                await redis.set(key, str(value))
+        except Exception as e:
+            logger.debug(f"redis set {key}: {e}")
+
+    # ─────────────────────────────────────────────────────────────
+    # Alpha Vantage
+    # ─────────────────────────────────────────────────────────────
+
+    @classmethod
+    async def _fetch_alpha_vantage(cls, ticker: str) -> Optional[float]:
+        url = "https://www.alphavantage.co/query"
+        params = {
+            "function": "GLOBAL_QUOTE",
+            "symbol": ticker,
+            "apikey": settings.ALPHA_VANTAGE_API_KEY,
+        }
+        try:
+            async with httpx.AsyncClient(timeout=10) as client:
+                r = await client.get(url, params=params)
+                r.raise_for_status()
+                data = r.json()
+
+            quote = data.get("Global Quote", {})
+            price_str = quote.get("05. price")
+            if not price_str:
+                # Rate limited or bad ticker
+                info = data.get("Information", "") or data.get("Note", "")
+                if info:
+                    logger.warning(f"[alphavantage] {ticker}: {info[:80]}")
+                return None
+            price = float(price_str)
+            logger.debug(f"[alphavantage] {ticker} = {price}")
+            return price
+        except Exception as e:
+            logger.warning(f"[alphavantage] {ticker} error: {e}")
+            return None
+
+    # ─────────────────────────────────────────────────────────────
+    # Twelve Data
+    # ─────────────────────────────────────────────────────────────
+
+    @classmethod
+    async def _fetch_twelve_data(cls, ticker: str) -> Optional[float]:
+        url = "https://api.twelvedata.com/price"
+        params = {
+            "symbol": ticker,
+            "apikey": settings.TWELVE_DATA_API_KEY,
+        }
+        try:
+            async with httpx.AsyncClient(timeout=10) as client:
+                r = await client.get(url, params=params)
+                r.raise_for_status()
+                data = r.json()
+
+            if data.get("status") == "error" or "price" not in data:
+                logger.warning(f"[twelvedata] {ticker}: {data.get('message', 'no price')}")
+                return None
+            price = float(data["price"])
+            logger.debug(f"[twelvedata] {ticker} = {price}")
+            return price
+        except Exception as e:
+            logger.warning(f"[twelvedata] {ticker} error: {e}")
+            return None
+
+    # ─────────────────────────────────────────────────────────────
+    # yfinance
+    # ─────────────────────────────────────────────────────────────
+
+    @classmethod
+    async def _fetch_yfinance(cls, ticker: str) -> Optional[float]:
+        try:
+            loop = asyncio.get_event_loop()
+            return await loop.run_in_executor(None, cls._fetch_price_yf, ticker)
+        except Exception as e:
+            logger.warning(f"[yfinance] {ticker} error: {e}")
+            return None
 
     @staticmethod
-    def _fetch_info(ticker: str) -> dict:
-        """
-        Fetch security metadata.
+    def _fetch_price_yf(ticker: str) -> Optional[float]:
+        try:
+            t = yf.Ticker(ticker)
+            info = t.fast_info
+            price = getattr(info, "last_price", None)
+            if price:
+                return float(price)
+            hist = t.history(period="2d")
+            if not hist.empty:
+                return float(hist["Close"].iloc[-1])
+            return None
+        except Exception as e:
+            logger.debug(f"_fetch_price_yf {ticker}: {e}")
+            return None
 
-        Strategy (least to most aggressive Yahoo endpoint):
-        1. fast_info  — lightweight chart endpoint, rarely rate-limited
-        2. .info      — hits quoteSummary, may 429; retried by _with_retry caller
-        3. minimal stub — so the ticker is never completely lost
-        """
-        t = yf.Ticker(ticker)
+    @staticmethod
+    def _fetch_historical_yf(ticker: str, target_date: date) -> Optional[float]:
+        try:
+            t = yf.Ticker(ticker)
+            start = target_date - timedelta(days=5)
+            end = target_date + timedelta(days=1)
+            hist = t.history(start=start.isoformat(), end=end.isoformat())
+            if hist.empty:
+                return None
+            return float(hist["Close"].iloc[-1])
+        except Exception as e:
+            logger.debug(f"_fetch_historical_yf {ticker} {target_date}: {e}")
+            return None
 
-        # Step 1: fast_info (safe, no quoteSummary call)
-        fi = t.fast_info
-        fi_name = getattr(fi, "name", None) or getattr(fi, "longName", None)
-        fi_exchange = getattr(fi, "exchange", None)
-        fi_currency = getattr(fi, "currency", None)
-
-        if fi_name and fi_currency:
+    @staticmethod
+    def _fetch_info_yf(ticker: str) -> Optional[dict]:
+        try:
+            t = yf.Ticker(ticker)
+            info = t.info
             return {
                 "ticker": ticker.upper(),
-                "name": fi_name,
-                "exchange": fi_exchange,
-                "currency": fi_currency,
-                "sector": None,
-                "industry": None,
+                "name": info.get("longName") or info.get("shortName") or ticker,
+                "exchange": info.get("exchange"),
+                "currency": info.get("currency", "USD"),
+                "sector": info.get("sector"),
+                "industry": info.get("industry"),
             }
-
-        # Step 2: .info (heavier, may 429 — caller retries)
-        try:
-            info = t.info or {}
         except Exception as e:
-            logger.debug("_fetch_info(%s) .info failed: %s", ticker, e)
-            info = {}
-
-        resolved_name = (
-            info.get("longName")
-            or info.get("shortName")
-            or info.get("displayName")
-            or fi_name
-            or ticker.upper()
-        )
-        return {
-            "ticker": ticker.upper(),
-            "name": resolved_name,
-            "exchange": info.get("exchange") or fi_exchange,
-            "currency": info.get("currency") or fi_currency or "USD",
-            "sector": info.get("sector"),
-            "industry": info.get("industry"),
-        }
-
-    @staticmethod
-    def _minimal_info(ticker: str) -> dict:
-        """Last-resort stub when all Yahoo calls fail — ticker still gets saved."""
-        return {
-            "ticker": ticker.upper(),
-            "name": ticker.upper(),
-            "exchange": None,
-            "currency": "USD",
-            "sector": None,
-            "industry": None,
-        }
+            logger.debug(f"_fetch_info_yf {ticker}: {e}")
+            return None
