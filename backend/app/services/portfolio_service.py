@@ -1,46 +1,24 @@
-"""
-Portfolio Service.
-
-Key fixes vs original:
-- get_or_create_security: if the ticker already exists in DB, NEVER calls Yahoo.
-  This eliminates 99% of 429s since repeat lookups are instant DB reads.
-- Security info fetch now always returns something (even a stub), so the
-  endpoint never 500s on a Yahoo rate-limit — it saves the ticker with a
-  placeholder name instead of crashing.
-- _update_position: ratio checks are safer around zero/negative values.
-"""
-
-from __future__ import annotations
-
-import logging
+from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy import select, and_, delete
+from sqlalchemy.orm import load_only
+from fastapi import HTTPException, status
 from decimal import Decimal
 from datetime import date
 
-from fastapi import HTTPException
-from sqlalchemy import and_, select
-from sqlalchemy.ext.asyncio import AsyncSession
-
-from app.models.portfolio import Portfolio, Position, Security
+from app.models.portfolio import Portfolio, Security, Position
 from app.models.transaction import Transaction, TransactionType
 from app.schemas.portfolio import (
-    PortfolioCreate,
-    PortfolioResponse,
-    PortfolioSummary,
-    PortfolioUpdate,
-    PositionResponse,
-    SecurityResponse,
-    TransactionCreate,
-    TransactionResponse,
+    PortfolioCreate, PortfolioUpdate, PortfolioResponse,
+    TransactionCreate, TransactionResponse,
+    PositionResponse, PortfolioSummary, SecurityResponse,
 )
-from app.services.fx_service import FxService
 from app.services.price_service import PriceService
-
-logger = logging.getLogger(__name__)
+from app.services.fx_service import FxService
 
 
 class PortfolioService:
 
-    # ── Portfolios ──────────────────────────────────────────────────────
+    # ── Portfolios ────────────────────────────────────────────────────────────
 
     @staticmethod
     async def create(db: AsyncSession, user_id: int, data: PortfolioCreate) -> PortfolioResponse:
@@ -58,9 +36,7 @@ class PortfolioService:
     @staticmethod
     async def get_or_404(db: AsyncSession, user_id: int, portfolio_id: int) -> Portfolio:
         result = await db.execute(
-            select(Portfolio).where(
-                and_(Portfolio.id == portfolio_id, Portfolio.user_id == user_id)
-            )
+            select(Portfolio).where(and_(Portfolio.id == portfolio_id, Portfolio.user_id == user_id))
         )
         p = result.scalar_one_or_none()
         if not p:
@@ -68,9 +44,7 @@ class PortfolioService:
         return p
 
     @staticmethod
-    async def update(
-        db: AsyncSession, user_id: int, portfolio_id: int, data: PortfolioUpdate
-    ) -> PortfolioResponse:
+    async def update(db: AsyncSession, user_id: int, portfolio_id: int, data: PortfolioUpdate) -> PortfolioResponse:
         p = await PortfolioService.get_or_404(db, user_id, portfolio_id)
         for field, value in data.model_dump(exclude_unset=True).items():
             setattr(p, field, value)
@@ -83,45 +57,19 @@ class PortfolioService:
         p = await PortfolioService.get_or_404(db, user_id, portfolio_id)
         await db.delete(p)
 
-    # ── Securities ───────────────────────────────────────────────────────
+    # ── Securities ────────────────────────────────────────────────────────────
 
     @staticmethod
     async def get_or_create_security(db: AsyncSession, ticker: str) -> Security:
-        """
-        Look up ticker in DB first.  Only calls Yahoo Finance if the ticker
-        is not already stored — this prevents repeat 429s.
-        """
-        ticker = ticker.upper().strip()
-
-        # DB hit — no Yahoo call needed
+        ticker = ticker.upper()
         result = await db.execute(select(Security).where(Security.ticker == ticker))
         sec = result.scalar_one_or_none()
         if sec:
             return sec
 
-        # Not in DB — fetch from Yahoo (with retry + fallback stub)
         info = await PriceService.get_security_info(ticker)
-
         if not info:
-            # Should never happen (get_security_info always returns a stub),
-            # but be safe
-            info = {
-                "ticker": ticker,
-                "name": ticker,
-                "exchange": None,
-                "currency": "USD",
-                "sector": None,
-                "industry": None,
-            }
-
-        # If Yahoo returned only a stub (name == ticker), log a warning but
-        # still save it so the user can edit it later — do NOT 500.
-        if info["name"] == ticker:
-            logger.warning(
-                "Could not fetch full metadata for %s from Yahoo Finance "
-                "(rate limited or delisted). Saved with placeholder name.",
-                ticker,
-            )
+            raise HTTPException(status_code=422, detail=f"Ticker '{ticker}' not found")
 
         sec = Security(**info)
         db.add(sec)
@@ -132,20 +80,17 @@ class PortfolioService:
     @staticmethod
     async def search_securities(db: AsyncSession, q: str) -> list[SecurityResponse]:
         result = await db.execute(
-            select(Security)
-            .where(Security.ticker.ilike(f"%{q}%") | Security.name.ilike(f"%{q}%"))
-            .limit(20)
+            select(Security).where(
+                Security.ticker.ilike(f"%{q}%") | Security.name.ilike(f"%{q}%")
+            ).limit(20)
         )
         return [SecurityResponse.model_validate(s) for s in result.scalars().all()]
 
-    # ── Transactions ─────────────────────────────────────────────────────
+    # ── Transactions ──────────────────────────────────────────────────────────
 
     @staticmethod
     async def add_transaction(
-        db: AsyncSession,
-        user_id: int,
-        portfolio_id: int,
-        data: TransactionCreate,
+        db: AsyncSession, user_id: int, portfolio_id: int, data: TransactionCreate,
     ) -> TransactionResponse:
         await PortfolioService.get_or_404(db, user_id, portfolio_id)
 
@@ -181,48 +126,37 @@ class PortfolioService:
 
         await PortfolioService._update_position(db, portfolio_id, security, tx, fx_rate)
         await db.refresh(tx)
+
         return await PortfolioService._tx_to_response(db, tx)
 
     @staticmethod
     async def _tx_to_response(db: AsyncSession, tx: Transaction) -> TransactionResponse:
         result = await db.execute(select(Security).where(Security.id == tx.security_id))
         security = result.scalar_one()
-        tx_data = {
-            **{c.name: getattr(tx, c.name) for c in tx.__table__.columns},
-            "security": SecurityResponse.model_validate(security),
-        }
-        return TransactionResponse.model_validate(tx_data)
+        data = TransactionResponse.model_validate(tx)
+        data.security = SecurityResponse.model_validate(security)
+        return data
 
     @staticmethod
     async def _update_position(
-        db: AsyncSession,
-        portfolio_id: int,
-        security: Security,
-        tx: Transaction,
-        fx_rate: Decimal,
+        db: AsyncSession, portfolio_id: int, security: Security, tx: Transaction, fx_rate: Decimal,
     ) -> None:
         result = await db.execute(
             select(Position).where(
-                and_(
-                    Position.portfolio_id == portfolio_id,
-                    Position.security_id == security.id,
-                )
+                and_(Position.portfolio_id == portfolio_id, Position.security_id == security.id)
             )
         )
         pos = result.scalar_one_or_none()
 
         if tx.type == TransactionType.SPLIT:
-            if pos and tx.split_ratio and tx.split_ratio > 0:
+            if pos and tx.split_ratio:
                 pos.quantity = pos.quantity * tx.split_ratio
-                pos.avg_cost_usd = pos.avg_cost_usd / tx.split_ratio
-                pos.avg_cost_kzt = pos.avg_cost_kzt / tx.split_ratio
+                if tx.split_ratio > 0:
+                    pos.avg_cost_usd = pos.avg_cost_usd / tx.split_ratio
+                    pos.avg_cost_kzt = pos.avg_cost_kzt / tx.split_ratio
             return
 
-        if tx.type in (
-            TransactionType.DIVIDEND,
-            TransactionType.TAX,
-            TransactionType.COMMISSION,
-        ):
+        if tx.type in (TransactionType.DIVIDEND, TransactionType.TAX, TransactionType.COMMISSION):
             return
 
         if tx.type == TransactionType.BUY:
@@ -234,8 +168,8 @@ class PortfolioService:
                     portfolio_id=portfolio_id,
                     security_id=security.id,
                     quantity=tx.quantity,
-                    avg_cost_usd=(cost_usd / tx.quantity) if tx.quantity else Decimal("0"),
-                    avg_cost_kzt=(cost_kzt / tx.quantity) if tx.quantity else Decimal("0"),
+                    avg_cost_usd=cost_usd / tx.quantity if tx.quantity else Decimal("0"),
+                    avg_cost_kzt=cost_kzt / tx.quantity if tx.quantity else Decimal("0"),
                     total_invested_usd=cost_usd,
                     total_invested_kzt=cost_kzt,
                 )
@@ -244,29 +178,28 @@ class PortfolioService:
                 new_qty = pos.quantity + tx.quantity
                 pos.total_invested_usd += cost_usd
                 pos.total_invested_kzt += cost_kzt
-                pos.avg_cost_usd = pos.total_invested_usd / new_qty if new_qty else Decimal("0")
-                pos.avg_cost_kzt = pos.total_invested_kzt / new_qty if new_qty else Decimal("0")
+                pos.avg_cost_usd = pos.total_invested_usd / new_qty
+                pos.avg_cost_kzt = pos.total_invested_kzt / new_qty
                 pos.quantity = new_qty
 
         elif tx.type == TransactionType.SELL:
             if pos is None or pos.quantity < tx.quantity:
-                have = pos.quantity if pos else Decimal("0")
                 raise HTTPException(
                     status_code=422,
-                    detail=f"Insufficient shares: have {have}, selling {tx.quantity}",
+                    detail=f"Insufficient shares: have {pos.quantity if pos else 0}, selling {tx.quantity}",
                 )
             ratio = tx.quantity / pos.quantity
             pos.total_invested_usd -= pos.total_invested_usd * ratio
             pos.total_invested_kzt -= pos.total_invested_kzt * ratio
             pos.quantity -= tx.quantity
-            if pos.quantity <= Decimal("0"):
+            if pos.quantity <= 0:
                 await db.delete(pos)
 
         await db.flush()
 
     @staticmethod
     async def list_transactions(
-        db: AsyncSession, user_id: int, portfolio_id: int
+        db: AsyncSession, user_id: int, portfolio_id: int,
     ) -> list[TransactionResponse]:
         await PortfolioService.get_or_404(db, user_id, portfolio_id)
 
@@ -277,114 +210,125 @@ class PortfolioService:
         )
         txs = result.scalars().all()
 
+        # Fetch all securities in one query
         security_ids = list({tx.security_id for tx in txs})
-        sec_result = await db.execute(
-            select(Security).where(Security.id.in_(security_ids))
-        )
+        sec_result = await db.execute(select(Security).where(Security.id.in_(security_ids)))
         securities = {s.id: s for s in sec_result.scalars().all()}
 
         responses = []
         for tx in txs:
-            tx_data = {
-                **{c.name: getattr(tx, c.name) for c in tx.__table__.columns},
-                "security": SecurityResponse.model_validate(securities[tx.security_id]),
-            }
-            responses.append(TransactionResponse.model_validate(tx_data))
+            r = TransactionResponse.model_validate(tx)
+            r.security = SecurityResponse.model_validate(securities[tx.security_id])
+            responses.append(r)
         return responses
 
-    # ── Portfolio Summary ─────────────────────────────────────────────────
+    # ── Portfolio Summary ─────────────────────────────────────────────────────
 
     @staticmethod
-    async def get_summary(
-        db: AsyncSession, user_id: int, portfolio_id: int
-    ) -> PortfolioSummary:
+    async def get_summary(db: AsyncSession, user_id: int, portfolio_id: int) -> PortfolioSummary:
         portfolio = await PortfolioService.get_or_404(db, user_id, portfolio_id)
+        # Capture portfolio fields before any async calls that might expire the object
+        portfolio_data = PortfolioResponse.model_validate(portfolio)
 
         result = await db.execute(
             select(Position).where(Position.portfolio_id == portfolio_id)
         )
         positions = result.scalars().all()
 
+        # Extract all needed data from positions immediately while session is active
+        position_snapshots = [
+            {
+                "id": pos.id,
+                "portfolio_id": pos.portfolio_id,
+                "security_id": pos.security_id,
+                "quantity": pos.quantity,
+                "avg_cost_usd": pos.avg_cost_usd,
+                "avg_cost_kzt": pos.avg_cost_kzt,
+                "total_invested_usd": pos.total_invested_usd,
+                "total_invested_kzt": pos.total_invested_kzt,
+            }
+            for pos in positions
+        ]
+
         fx_rate = await FxService.get_rate(db)
 
-        security_ids = [p.security_id for p in positions]
-        securities: dict[int, Security] = {}
+        # Fetch securities in one query
+        security_ids = [snap["security_id"] for snap in position_snapshots]
+        securities = {}
         if security_ids:
-            sec_result = await db.execute(
-                select(Security).where(Security.id.in_(security_ids))
-            )
-            securities = {s.id: s for s in sec_result.scalars().all()}
+            sec_result = await db.execute(select(Security).where(Security.id.in_(security_ids)))
+            sec_rows = sec_result.scalars().all()
+            # Snapshot security data too
+            for s in sec_rows:
+                securities[s.id] = {
+                    "id": s.id,
+                    "ticker": s.ticker,
+                    "name": s.name,
+                    "exchange": s.exchange,
+                    "currency": s.currency,
+                    "sector": s.sector,
+                    "industry": s.industry,
+                }
 
-        tickers = [
-            securities[p.security_id].ticker
-            for p in positions
-            if p.security_id in securities
-        ]
+        tickers = [securities[snap["security_id"]]["ticker"]
+                   for snap in position_snapshots
+                   if snap["security_id"] in securities]
         prices = await PriceService.get_prices_batch(tickers) if tickers else {}
 
         enriched_positions = []
         total_value_usd = Decimal("0")
         total_invested_usd = Decimal("0")
 
-        for pos in positions:
-            security = securities.get(pos.security_id)
-            if not security:
+        for snap in position_snapshots:
+            sec_data = securities.get(snap["security_id"])
+            if not sec_data:
                 continue
 
-            price_usd = prices.get(security.ticker)
-            if price_usd and price_usd > 0:
+            price_usd = prices.get(sec_data["ticker"])
+            if price_usd:
                 price_usd_dec = Decimal(str(price_usd))
                 price_kzt_dec = price_usd_dec * fx_rate
-                current_value_usd = price_usd_dec * pos.quantity
+                current_value_usd = price_usd_dec * snap["quantity"]
                 current_value_kzt = current_value_usd * fx_rate
-                profit_usd = current_value_usd - pos.total_invested_usd
+                profit_usd = current_value_usd - snap["total_invested_usd"]
                 profit_kzt = profit_usd * fx_rate
-                profit_pct = (
-                    (profit_usd / pos.total_invested_usd * 100)
-                    if pos.total_invested_usd
-                    else Decimal("0")
-                )
+                profit_pct = (profit_usd / snap["total_invested_usd"] * 100) if snap["total_invested_usd"] else Decimal("0")
                 total_value_usd += current_value_usd
             else:
-                price_usd_dec = price_kzt_dec = None
-                current_value_usd = current_value_kzt = None
+                price_usd_dec = price_kzt_dec = current_value_usd = current_value_kzt = None
                 profit_usd = profit_kzt = profit_pct = None
-                total_value_usd += pos.total_invested_usd
+                total_value_usd += snap["total_invested_usd"]
 
-            total_invested_usd += pos.total_invested_usd
+            total_invested_usd += snap["total_invested_usd"]
 
-            enriched_positions.append(
-                PositionResponse(
-                    id=pos.id,
-                    portfolio_id=pos.portfolio_id,
-                    security=SecurityResponse.model_validate(security),
-                    quantity=pos.quantity,
-                    avg_cost_usd=pos.avg_cost_usd,
-                    avg_cost_kzt=pos.avg_cost_kzt,
-                    total_invested_usd=pos.total_invested_usd,
-                    total_invested_kzt=pos.total_invested_kzt,
-                    current_price_usd=price_usd_dec,
-                    current_price_kzt=price_kzt_dec,
-                    current_value_usd=current_value_usd,
-                    current_value_kzt=current_value_kzt,
-                    profit_usd=profit_usd,
-                    profit_kzt=profit_kzt,
-                    profit_percent=profit_pct,
-                )
-            )
+            enriched_positions.append(PositionResponse(
+                id=snap["id"],
+                portfolio_id=snap["portfolio_id"],
+                security=SecurityResponse(**sec_data),
+                quantity=snap["quantity"],
+                avg_cost_usd=snap["avg_cost_usd"],
+                avg_cost_kzt=snap["avg_cost_kzt"],
+                total_invested_usd=snap["total_invested_usd"],
+                total_invested_kzt=snap["total_invested_kzt"],
+                current_price_usd=price_usd_dec,
+                current_price_kzt=price_kzt_dec,
+                current_value_usd=current_value_usd,
+                current_value_kzt=current_value_kzt,
+                profit_usd=profit_usd,
+                profit_kzt=profit_kzt,
+                profit_percent=profit_pct,
+            ))
 
         total_value_kzt = total_value_usd * fx_rate
         total_invested_kzt = total_invested_usd * fx_rate
         total_profit_usd = total_value_usd - total_invested_usd
         total_profit_kzt = total_profit_usd * fx_rate
         total_profit_pct = (
-            (total_profit_usd / total_invested_usd * 100)
-            if total_invested_usd
-            else Decimal("0")
+            (total_profit_usd / total_invested_usd * 100) if total_invested_usd else Decimal("0")
         )
 
         return PortfolioSummary(
-            portfolio=PortfolioResponse.model_validate(portfolio),
+            portfolio=portfolio_data,
             total_value_usd=total_value_usd,
             total_value_kzt=total_value_kzt,
             total_invested_usd=total_invested_usd,
