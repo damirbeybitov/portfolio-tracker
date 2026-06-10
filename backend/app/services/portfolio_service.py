@@ -217,8 +217,25 @@ class PortfolioService:
 
         responses = []
         for tx in txs:
-            r = TransactionResponse.model_validate(tx)
-            r.security = SecurityResponse.model_validate(securities[tx.security_id])
+            sec = securities[tx.security_id]
+            r = TransactionResponse(
+                id=tx.id,
+                portfolio_id=tx.portfolio_id,
+                security=SecurityResponse.model_validate(sec),
+                type=tx.type,
+                date=tx.date,
+                quantity=tx.quantity,
+                price_usd=tx.price_usd,
+                price_kzt=tx.price_kzt,
+                total_usd=tx.total_usd,
+                total_kzt=tx.total_kzt,
+                fx_rate_usd_kzt=tx.fx_rate_usd_kzt,
+                commission_usd=tx.commission_usd,
+                commission_kzt=tx.commission_kzt,
+                split_ratio=tx.split_ratio,
+                notes=tx.notes,
+                created_at=tx.created_at,
+            )
             responses.append(r)
         return responses
 
