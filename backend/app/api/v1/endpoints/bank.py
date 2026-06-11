@@ -117,6 +117,20 @@ async def add_transaction(
     return await BankService.add_transaction(db, user_id, account_id, data)
 
 
+@router.delete("/accounts/{account_id}/transactions/{transaction_id}", status_code=204)
+async def delete_bank_transaction(
+    account_id: int,
+    transaction_id: int,
+    user_id: int = Depends(get_current_user_id),
+    db: AsyncSession = Depends(get_db),
+):
+    """
+    Delete a bank transaction and reverse its effect on the account balance.
+    The transaction amount is subtracted back from the current balance.
+    """
+    await BankService.delete_transaction(db, user_id, account_id, transaction_id)
+
+
 # ── FX Rates ──────────────────────────────────────────────────────────────────
 
 @router.get("/fx", response_model=dict)

@@ -128,11 +128,12 @@ const TX_BADGES: Record<string, string> = {
                         <th class="num-col">Balance After</th>
                         <th class="num-col">FX Rate</th>
                         <th>Notes</th>
+                        <th></th>
                       </tr>
                     </thead>
                     <tbody>
                       @for (tx of selectedTxs(); track tx.id) {
-                        <tr>
+                        <tr [class.deleting]="deletingTxId() === tx.id">
                           <td class="num date-cell">{{ tx.date | date:'dd MMM yyyy' }}</td>
                           <td><span class="badge" [class]="getTxBadge(tx.type)">{{ tx.type }}</span></td>
                           <td class="num-col num" [class.profit]="tx.amount > 0" [class.loss]="tx.amount < 0">
@@ -145,6 +146,31 @@ const TX_BADGES: Record<string, string> = {
                             {{ tx.fx_rate ? (tx.fx_rate | number:'1.2-2') : '—' }}
                           </td>
                           <td class="text-secondary" style="font-size:12px">{{ tx.notes || '' }}</td>
+                          <td class="action-cell">
+                            <button
+                              class="btn-delete"
+                              [class.confirming]="confirmBankTxId() === tx.id"
+                              [disabled]="deletingTxId() === tx.id"
+                              (click)="onDeleteTxClick(tx)"
+                              [title]="confirmBankTxId() === tx.id ? 'Click again to confirm' : 'Delete transaction'"
+                            >
+                              @if (deletingTxId() === tx.id) {
+                                <div class="spinner" style="width:14px;height:14px;border-width:2px"></div>
+                              } @else if (confirmBankTxId() === tx.id) {
+                                <svg width="14" height="14" fill="none" stroke="currentColor" stroke-width="2.5" viewBox="0 0 24 24">
+                                  <polyline points="20 6 9 17 4 12"/>
+                                </svg>
+                                <span>Confirm</span>
+                              } @else {
+                                <svg width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24">
+                                  <polyline points="3 6 5 6 21 6"/>
+                                  <path d="M19 6l-1 14a2 2 0 0 1-2 2H8a2 2 0 0 1-2-2L5 6"/>
+                                  <path d="M10 11v6M14 11v6"/>
+                                  <path d="M9 6V4a1 1 0 0 1 1-1h4a1 1 0 0 1 1 1v2"/>
+                                </svg>
+                              }
+                            </button>
+                          </td>
                         </tr>
                       }
                     </tbody>
@@ -341,6 +367,17 @@ const TX_BADGES: Record<string, string> = {
         </div>
       </div>
     }
+
+    <!-- Delete error toast -->
+    @if (deleteError()) {
+      <div class="toast toast-error">
+        <svg width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24">
+          <circle cx="12" cy="12" r="10"/><line x1="12" y1="8" x2="12" y2="12"/><line x1="12" y1="16" x2="12.01" y2="16"/>
+        </svg>
+        {{ deleteError() }}
+        <button class="toast-close" (click)="deleteError.set('')">✕</button>
+      </div>
+    }
   `,
   styles: [`
     .accounts-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(280px, 1fr)); gap: 16px; }
@@ -359,6 +396,47 @@ const TX_BADGES: Record<string, string> = {
     .rate-history { background: var(--bg-base); border: 1px solid var(--border); border-radius: var(--radius-sm); padding: 12px 14px; display: flex; flex-direction: column; gap: 8px; margin-bottom: 4px; }
     .rate-history-label { font-size: 11px; text-transform: uppercase; letter-spacing: 0.5px; color: var(--text-muted); margin-bottom: 4px; }
     .rate-row { display: flex; align-items: center; gap: 12px; font-size: 13px; span:first-child { font-family: var(--font-mono); font-weight: 600; color: var(--green); } }
+
+    /* Row deleting state */
+    tr.deleting td { opacity: 0.4; transition: opacity 0.2s; }
+
+    /* Delete button */
+    .action-cell { width: 80px; text-align: right; padding-right: 12px !important; }
+    .btn-delete {
+      display: inline-flex; align-items: center; gap: 5px;
+      padding: 4px 9px; border-radius: var(--radius-sm);
+      font-size: 11px; font-weight: 600;
+      border: 1px solid transparent; cursor: pointer;
+      background: transparent; color: var(--text-muted);
+      transition: all var(--transition); white-space: nowrap;
+      &:hover:not(:disabled):not(.confirming) {
+        background: var(--red-dim); color: var(--red);
+        border-color: rgba(248,113,113,0.25);
+      }
+      &.confirming {
+        background: var(--red-dim); color: var(--red);
+        border-color: rgba(248,113,113,0.4);
+        animation: pulse-border 1s ease-in-out infinite;
+      }
+      &:disabled { opacity: 0.5; cursor: not-allowed; }
+    }
+    @keyframes pulse-border {
+      0%, 100% { border-color: rgba(248,113,113,0.4); }
+      50% { border-color: rgba(248,113,113,0.8); }
+    }
+
+    /* Toast */
+    .toast {
+      position: fixed; bottom: 24px; right: 24px; z-index: 9999;
+      display: flex; align-items: center; gap: 10px;
+      padding: 12px 16px; border-radius: var(--radius);
+      font-size: 13px; font-weight: 500;
+      box-shadow: var(--shadow-elevated);
+      animation: slideIn 0.2s ease;
+    }
+    .toast-error { background: var(--bg-elevated); border: 1px solid rgba(248,113,113,0.4); color: var(--red); }
+    .toast-close { background: none; border: none; cursor: pointer; color: inherit; opacity: 0.7; padding: 0; margin-left: 4px; font-size: 14px; &:hover { opacity: 1; } }
+    @keyframes slideIn { from { opacity: 0; transform: translateY(8px); } to { opacity: 1; transform: translateY(0); } }
   `]
 })
 export class BankComponent implements OnInit {
@@ -369,6 +447,10 @@ export class BankComponent implements OnInit {
   selectedTxs = signal<BankTransaction[]>([]);
   currentRates = signal<BankInterestRate[]>([]);
   fxRate = signal(450);
+  deletingTxId = signal<number | null>(null);
+  confirmBankTxId = signal<number | null>(null);
+  deleteError = signal('');
+  private confirmTimer: ReturnType<typeof setTimeout> | null = null;
 
   // Modals
   showCreateModal = false;
@@ -402,23 +484,43 @@ export class BankComponent implements OnInit {
   constructor(private api: ApiService) {}
 
   ngOnInit(): void {
-    this.api.listBankAccounts().subscribe(accs => { this.accounts.set(accs); this.loading.set(false); if (accs.length > 0) this.selectAccount(accs[0]); });
-    this.api.getFxRate().subscribe(fx => { this.fxRate.set(+fx.usd_to_kzt); this.fxForm.usd_to_kzt = +fx.usd_to_kzt; });
+    this.api.listBankAccounts().subscribe(accs => {
+      this.accounts.set(accs);
+      this.loading.set(false);
+      if (accs.length > 0) this.selectAccount(accs[0]);
+    });
+    this.api.getFxRate().subscribe(fx => {
+      this.fxRate.set(+fx.usd_to_kzt);
+      this.fxForm.usd_to_kzt = +fx.usd_to_kzt;
+    });
   }
 
   selectAccount(acc: BankAccount): void {
     this.selectedAccountId.set(acc.id);
     this.txLoading.set(true);
-    this.api.listBankTransactions(acc.id).subscribe(txs => { this.selectedTxs.set(txs); this.txLoading.set(false); });
+    this.confirmBankTxId.set(null);
+    this.api.listBankTransactions(acc.id).subscribe(txs => {
+      this.selectedTxs.set(txs);
+      this.txLoading.set(false);
+    });
   }
 
-  openCreateAccount(): void { this.newAccount = { name: '', currency: 'KZT', balance: 0 }; this.modalError = ''; this.showCreateModal = true; }
+  openCreateAccount(): void {
+    this.newAccount = { name: '', currency: 'KZT', balance: 0 };
+    this.modalError = '';
+    this.showCreateModal = true;
+  }
 
   createAccount(): void {
     if (!this.newAccount.name) return;
     this.modalLoading = true; this.modalError = '';
     this.api.createBankAccount(this.newAccount).subscribe({
-      next: (acc) => { this.accounts.update(prev => [...prev, acc]); this.showCreateModal = false; this.modalLoading = false; this.selectAccount(acc); },
+      next: (acc) => {
+        this.accounts.update(prev => [...prev, acc]);
+        this.showCreateModal = false;
+        this.modalLoading = false;
+        this.selectAccount(acc);
+      },
       error: (e) => { this.modalError = e.error?.detail || 'Failed'; this.modalLoading = false; }
     });
   }
@@ -453,6 +555,41 @@ export class BankComponent implements OnInit {
     });
   }
 
+  onDeleteTxClick(tx: BankTransaction): void {
+    const acc = this.selectedAccount();
+    if (!acc) return;
+
+    if (this.confirmBankTxId() === tx.id) {
+      if (this.confirmTimer) clearTimeout(this.confirmTimer);
+      this.confirmBankTxId.set(null);
+      this.executeDeleteBankTx(acc.id, tx.id);
+    } else {
+      if (this.confirmTimer) clearTimeout(this.confirmTimer);
+      this.confirmBankTxId.set(tx.id);
+      this.confirmTimer = setTimeout(() => {
+        this.confirmBankTxId.set(null);
+      }, 3000);
+    }
+  }
+
+  private executeDeleteBankTx(accountId: number, transactionId: number): void {
+    this.deletingTxId.set(transactionId);
+    this.deleteError.set('');
+    this.api.deleteBankTransaction(accountId, transactionId).subscribe({
+      next: () => {
+        this.selectedTxs.update(txs => txs.filter(t => t.id !== transactionId));
+        this.deletingTxId.set(null);
+        // Refresh account to get updated balance
+        this.api.listBankAccounts().subscribe(accs => this.accounts.set(accs));
+      },
+      error: (e) => {
+        this.deleteError.set(e.error?.detail || 'Failed to delete transaction.');
+        this.deletingTxId.set(null);
+        setTimeout(() => this.deleteError.set(''), 5000);
+      }
+    });
+  }
+
   openRateModal(acc: BankAccount): void {
     this.rateTargetAccount = acc;
     this.newRate = { rate_percent: acc.current_rate || 0, effective_from: new Date().toISOString().split('T')[0], notes: '' };
@@ -480,7 +617,11 @@ export class BankComponent implements OnInit {
   setFxRate(): void {
     this.fxLoading = true; this.fxError = '';
     this.api.setFxRate(this.fxForm).subscribe({
-      next: () => { this.fxRate.set(this.fxForm.usd_to_kzt); this.showFxModal = false; this.fxLoading = false; },
+      next: () => {
+        this.fxRate.set(this.fxForm.usd_to_kzt);
+        this.showFxModal = false;
+        this.fxLoading = false;
+      },
       error: (e) => { this.fxError = e.error?.detail || 'Failed'; this.fxLoading = false; }
     });
   }

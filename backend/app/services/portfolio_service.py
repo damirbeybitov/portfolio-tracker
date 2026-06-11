@@ -130,6 +130,82 @@ class PortfolioService:
         return await PortfolioService._tx_to_response(db, tx)
 
     @staticmethod
+    async def delete_transaction(
+        db: AsyncSession, user_id: int, portfolio_id: int, transaction_id: int,
+    ) -> None:
+        """Delete a transaction and reverse its effect on the position."""
+        await PortfolioService.get_or_404(db, user_id, portfolio_id)
+
+        result = await db.execute(
+            select(Transaction).where(
+                and_(Transaction.id == transaction_id, Transaction.portfolio_id == portfolio_id)
+            )
+        )
+        tx = result.scalar_one_or_none()
+        if not tx:
+            raise HTTPException(status_code=404, detail="Transaction not found")
+
+        result = await db.execute(select(Security).where(Security.id == tx.security_id))
+        security = result.scalar_one_or_none()
+
+        if security:
+            result = await db.execute(
+                select(Position).where(
+                    and_(Position.portfolio_id == portfolio_id, Position.security_id == tx.security_id)
+                )
+            )
+            pos = result.scalar_one_or_none()
+
+            if tx.type == TransactionType.BUY:
+                if pos:
+                    cost_usd = tx.price_usd * tx.quantity + tx.commission_usd
+                    cost_kzt = tx.price_kzt * tx.quantity + tx.commission_kzt
+                    new_qty = pos.quantity - tx.quantity
+                    if new_qty <= Decimal("0"):
+                        await db.delete(pos)
+                    else:
+                        pos.total_invested_usd = max(pos.total_invested_usd - cost_usd, Decimal("0"))
+                        pos.total_invested_kzt = max(pos.total_invested_kzt - cost_kzt, Decimal("0"))
+                        pos.quantity = new_qty
+                        pos.avg_cost_usd = pos.total_invested_usd / new_qty
+                        pos.avg_cost_kzt = pos.total_invested_kzt / new_qty
+
+            elif tx.type == TransactionType.SELL:
+                # Reverse a sell: put shares back, restore proportional cost basis
+                cost_usd = tx.price_usd * tx.quantity
+                cost_kzt = tx.price_kzt * tx.quantity
+                if pos is None:
+                    pos = Position(
+                        portfolio_id=portfolio_id,
+                        security_id=tx.security_id,
+                        quantity=tx.quantity,
+                        avg_cost_usd=tx.price_usd,
+                        avg_cost_kzt=tx.price_kzt,
+                        total_invested_usd=cost_usd,
+                        total_invested_kzt=cost_kzt,
+                    )
+                    db.add(pos)
+                else:
+                    new_qty = pos.quantity + tx.quantity
+                    pos.total_invested_usd += cost_usd
+                    pos.total_invested_kzt += cost_kzt
+                    pos.quantity = new_qty
+                    pos.avg_cost_usd = pos.total_invested_usd / new_qty
+                    pos.avg_cost_kzt = pos.total_invested_kzt / new_qty
+
+            elif tx.type == TransactionType.SPLIT:
+                # Reverse: divide qty back, multiply cost back
+                if pos and tx.split_ratio and tx.split_ratio > 0:
+                    pos.quantity = pos.quantity / tx.split_ratio
+                    pos.avg_cost_usd = pos.avg_cost_usd * tx.split_ratio
+                    pos.avg_cost_kzt = pos.avg_cost_kzt * tx.split_ratio
+
+            # DIVIDEND, TAX, COMMISSION — no position impact, just delete the record
+
+        await db.delete(tx)
+        await db.flush()
+
+    @staticmethod
     async def _tx_to_response(db: AsyncSession, tx: Transaction) -> TransactionResponse:
         result = await db.execute(select(Security).where(Security.id == tx.security_id))
         security = result.scalar_one()
@@ -210,7 +286,6 @@ class PortfolioService:
         )
         txs = result.scalars().all()
 
-        # Fetch all securities in one query
         security_ids = list({tx.security_id for tx in txs})
         sec_result = await db.execute(select(Security).where(Security.id.in_(security_ids)))
         securities = {s.id: s for s in sec_result.scalars().all()}
@@ -244,7 +319,6 @@ class PortfolioService:
     @staticmethod
     async def get_summary(db: AsyncSession, user_id: int, portfolio_id: int) -> PortfolioSummary:
         portfolio = await PortfolioService.get_or_404(db, user_id, portfolio_id)
-        # Capture portfolio fields before any async calls that might expire the object
         portfolio_data = PortfolioResponse.model_validate(portfolio)
 
         result = await db.execute(
@@ -252,7 +326,6 @@ class PortfolioService:
         )
         positions = result.scalars().all()
 
-        # Extract all needed data from positions immediately while session is active
         position_snapshots = [
             {
                 "id": pos.id,
@@ -269,13 +342,11 @@ class PortfolioService:
 
         fx_rate = await FxService.get_rate(db)
 
-        # Fetch securities in one query
         security_ids = [snap["security_id"] for snap in position_snapshots]
         securities = {}
         if security_ids:
             sec_result = await db.execute(select(Security).where(Security.id.in_(security_ids)))
             sec_rows = sec_result.scalars().all()
-            # Snapshot security data too
             for s in sec_rows:
                 securities[s.id] = {
                     "id": s.id,

@@ -52,6 +52,9 @@ export class ApiService {
   addTransaction(portfolioId: number, data: TransactionCreate): Observable<Transaction> {
     return this.http.post<Transaction>(`${API}/portfolios/${portfolioId}/transactions`, data);
   }
+  deleteTransaction(portfolioId: number, transactionId: number): Observable<void> {
+    return this.http.delete<void>(`${API}/portfolios/${portfolioId}/transactions/${transactionId}`);
+  }
 
   // Securities
   searchSecurities(q: string): Observable<Security[]> {
@@ -93,6 +96,9 @@ export class ApiService {
   }
   addBankTransaction(accountId: number, data: BankTransactionCreate): Observable<BankTransaction> {
     return this.http.post<BankTransaction>(`${API}/bank/accounts/${accountId}/transactions`, data);
+  }
+  deleteBankTransaction(accountId: number, transactionId: number): Observable<void> {
+    return this.http.delete<void>(`${API}/bank/accounts/${accountId}/transactions/${transactionId}`);
   }
   getFxRate(date?: string): Observable<FxRate> {
     const params = date ? new HttpParams().set('target_date', date) : new HttpParams();

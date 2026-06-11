@@ -59,6 +59,12 @@ class BankService:
         return acc
 
     @staticmethod
+    def _enrich_account(acc: BankAccount, rate: Optional[Decimal]) -> BankAccountResponse:
+        resp = BankAccountResponse.model_validate(acc)
+        resp.current_rate = rate
+        return resp
+
+    @staticmethod
     async def update_account(
         db: AsyncSession, user_id: int, account_id: int, data: BankAccountUpdate,
     ) -> BankAccountResponse:
@@ -183,6 +189,45 @@ class BankService:
             },
         )
         return BankTransactionResponse.model_validate(tx)
+
+    @staticmethod
+    async def delete_transaction(
+        db: AsyncSession, user_id: int, account_id: int, transaction_id: int,
+    ) -> None:
+        """Delete a bank transaction and reverse its balance effect."""
+        account = await BankService.get_account_or_404(db, user_id, account_id)
+
+        result = await db.execute(
+            select(BankTransaction).where(
+                and_(BankTransaction.id == transaction_id, BankTransaction.account_id == account_id)
+            )
+        )
+        tx = result.scalar_one_or_none()
+        if not tx:
+            raise HTTPException(status_code=404, detail="Transaction not found")
+
+        # Reverse the balance: subtract what was applied
+        new_balance = account.balance - tx.amount
+        if new_balance < 0:
+            raise HTTPException(
+                status_code=422,
+                detail=f"Cannot delete: reversal would result in negative balance ({new_balance:.2f})",
+            )
+
+        account.balance = new_balance
+
+        logger.info(
+            "Bank transaction deleted",
+            extra={
+                "account_id": account_id,
+                "tx_id": transaction_id,
+                "amount_reversed": float(tx.amount),
+                "new_balance": float(new_balance),
+            },
+        )
+
+        await db.delete(tx)
+        await db.flush()
 
     @staticmethod
     async def list_transactions(

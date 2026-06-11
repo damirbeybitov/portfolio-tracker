@@ -72,11 +72,12 @@ const TX_BADGES: Record<TransactionType, string> = {
                   <th class="num-col">FX Rate</th>
                   <th class="num-col">Commission</th>
                   <th>Notes</th>
+                  <th></th>
                 </tr>
               </thead>
               <tbody>
                 @for (tx of filtered(); track tx.id) {
-                  <tr>
+                  <tr [class.deleting]="deletingId() === tx.id">
                     <td class="date-cell num">{{ tx.date | date:'dd MMM yyyy' }}</td>
                     <td>
                       <span class="badge" [class]="getBadge(tx.type)">{{ tx.type }}</span>
@@ -104,6 +105,31 @@ const TX_BADGES: Record<TransactionType, string> = {
                         <span class="note-text" [title]="tx.notes">{{ tx.notes }}</span>
                       }
                     </td>
+                    <td class="action-cell">
+                      <button
+                        class="btn-delete"
+                        [class.confirming]="confirmDeleteId() === tx.id"
+                        [disabled]="deletingId() === tx.id"
+                        (click)="onDeleteClick(tx)"
+                        [title]="confirmDeleteId() === tx.id ? 'Click again to confirm deletion' : 'Delete transaction'"
+                      >
+                        @if (deletingId() === tx.id) {
+                          <div class="spinner" style="width:14px;height:14px;border-width:2px"></div>
+                        } @else if (confirmDeleteId() === tx.id) {
+                          <svg width="14" height="14" fill="none" stroke="currentColor" stroke-width="2.5" viewBox="0 0 24 24">
+                            <polyline points="20 6 9 17 4 12"/>
+                          </svg>
+                          <span>Confirm</span>
+                        } @else {
+                          <svg width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24">
+                            <polyline points="3 6 5 6 21 6"/>
+                            <path d="M19 6l-1 14a2 2 0 0 1-2 2H8a2 2 0 0 1-2-2L5 6"/>
+                            <path d="M10 11v6M14 11v6"/>
+                            <path d="M9 6V4a1 1 0 0 1 1-1h4a1 1 0 0 1 1 1v2"/>
+                          </svg>
+                        }
+                      </button>
+                    </td>
                   </tr>
                 }
               </tbody>
@@ -124,6 +150,17 @@ const TX_BADGES: Record<TransactionType, string> = {
         </div>
       }
     </div>
+
+    <!-- Delete error toast -->
+    @if (deleteError()) {
+      <div class="toast toast-error">
+        <svg width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24">
+          <circle cx="12" cy="12" r="10"/><line x1="12" y1="8" x2="12" y2="12"/><line x1="12" y1="16" x2="12.01" y2="16"/>
+        </svg>
+        {{ deleteError() }}
+        <button class="toast-close" (click)="deleteError.set('')">✕</button>
+      </div>
+    }
   `,
   styles: [`
     .back-link { font-size: 13px; color: var(--text-secondary); text-decoration: none; display: block; margin-bottom: 8px; &:hover { color: var(--accent); } }
@@ -136,6 +173,47 @@ const TX_BADGES: Record<TransactionType, string> = {
     .tot-label { font-size: 12px; color: var(--text-muted); text-transform: uppercase; letter-spacing: 0.5px; }
     .tot-value { font-size: 14px; font-weight: 600; }
     .tot-sep { color: var(--border-active); }
+
+    /* Row deleting state */
+    tr.deleting td { opacity: 0.4; transition: opacity 0.2s; }
+
+    /* Delete button */
+    .action-cell { width: 80px; text-align: right; padding-right: 12px !important; }
+    .btn-delete {
+      display: inline-flex; align-items: center; gap: 5px;
+      padding: 4px 9px; border-radius: var(--radius-sm);
+      font-size: 11px; font-weight: 600;
+      border: 1px solid transparent; cursor: pointer;
+      background: transparent; color: var(--text-muted);
+      transition: all var(--transition); white-space: nowrap;
+      &:hover:not(:disabled):not(.confirming) {
+        background: var(--red-dim); color: var(--red);
+        border-color: rgba(248,113,113,0.25);
+      }
+      &.confirming {
+        background: var(--red-dim); color: var(--red);
+        border-color: rgba(248,113,113,0.4);
+        animation: pulse-border 1s ease-in-out infinite;
+      }
+      &:disabled { opacity: 0.5; cursor: not-allowed; }
+    }
+    @keyframes pulse-border {
+      0%, 100% { border-color: rgba(248,113,113,0.4); }
+      50% { border-color: rgba(248,113,113,0.8); }
+    }
+
+    /* Toast */
+    .toast {
+      position: fixed; bottom: 24px; right: 24px; z-index: 9999;
+      display: flex; align-items: center; gap: 10px;
+      padding: 12px 16px; border-radius: var(--radius);
+      font-size: 13px; font-weight: 500;
+      box-shadow: var(--shadow-elevated);
+      animation: slideIn 0.2s ease;
+    }
+    .toast-error { background: var(--bg-elevated); border: 1px solid rgba(248,113,113,0.4); color: var(--red); }
+    .toast-close { background: none; border: none; cursor: pointer; color: inherit; opacity: 0.7; padding: 0; margin-left: 4px; font-size: 14px; &:hover { opacity: 1; } }
+    @keyframes slideIn { from { opacity: 0; transform: translateY(8px); } to { opacity: 1; transform: translateY(0); } }
   `]
 })
 export class TransactionsComponent implements OnInit {
@@ -148,6 +226,10 @@ export class TransactionsComponent implements OnInit {
   filterFrom = '';
   filterTo = '';
   totals = signal({ invested: 0, proceeds: 0, commissions: 0 });
+  deletingId = signal<number | null>(null);
+  confirmDeleteId = signal<number | null>(null);
+  deleteError = signal('');
+  private confirmTimer: ReturnType<typeof setTimeout> | null = null;
 
   constructor(private route: ActivatedRoute, private api: ApiService) {}
 
@@ -192,4 +274,39 @@ export class TransactionsComponent implements OnInit {
   }
 
   getBadge(type: TransactionType): string { return TX_BADGES[type] || 'badge-muted'; }
+
+  onDeleteClick(tx: Transaction): void {
+    if (this.confirmDeleteId() === tx.id) {
+      // Second click — confirmed, proceed with deletion
+      if (this.confirmTimer) clearTimeout(this.confirmTimer);
+      this.confirmDeleteId.set(null);
+      this.executeDelete(tx.id);
+    } else {
+      // First click — ask for confirmation
+      if (this.confirmTimer) clearTimeout(this.confirmTimer);
+      this.confirmDeleteId.set(tx.id);
+      // Auto-cancel confirmation after 3 seconds
+      this.confirmTimer = setTimeout(() => {
+        this.confirmDeleteId.set(null);
+      }, 3000);
+    }
+  }
+
+  private executeDelete(transactionId: number): void {
+    this.deletingId.set(transactionId);
+    this.deleteError.set('');
+    this.api.deleteTransaction(this.portfolioId, transactionId).subscribe({
+      next: () => {
+        this.transactions.update(txs => txs.filter(t => t.id !== transactionId));
+        this.applyFilters();
+        this.deletingId.set(null);
+      },
+      error: (e) => {
+        this.deleteError.set(e.error?.detail || 'Failed to delete transaction.');
+        this.deletingId.set(null);
+        // Auto-dismiss error after 5s
+        setTimeout(() => this.deleteError.set(''), 5000);
+      }
+    });
+  }
 }

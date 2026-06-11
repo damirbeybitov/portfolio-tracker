@@ -83,6 +83,23 @@ async def add_transaction(
     return await PortfolioService.add_transaction(db, user_id, portfolio_id, data)
 
 
+@router.delete("/{portfolio_id}/transactions/{transaction_id}", status_code=204)
+async def delete_transaction(
+    portfolio_id: int,
+    transaction_id: int,
+    user_id: int = Depends(get_current_user_id),
+    db: AsyncSession = Depends(get_db),
+):
+    """
+    Delete a transaction and reverse its effect on the position.
+    BUY reversal: decreases qty + cost basis.
+    SELL reversal: restores qty + cost basis.
+    SPLIT reversal: un-multiplies shares.
+    DIVIDEND/TAX/COMMISSION: deleted with no position change.
+    """
+    await PortfolioService.delete_transaction(db, user_id, portfolio_id, transaction_id)
+
+
 # ── Securities ────────────────────────────────────────────────────────────────
 
 @router.get("/securities/search", response_model=list[SecurityResponse], tags=["Securities"])
