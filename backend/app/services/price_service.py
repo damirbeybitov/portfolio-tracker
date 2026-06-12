@@ -137,13 +137,32 @@ class PriceService:
 
     @classmethod
     async def get_security_info(cls, ticker: str) -> Optional[dict]:
-        """Fetch basic security metadata via yfinance."""
+        """Fetch basic security metadata — multi-provider chain."""
+        ticker = ticker.upper()
+
+        # 1. Alpha Vantage
+        if settings.ALPHA_VANTAGE_API_KEY:
+            info = await cls._fetch_alpha_vantage_info(ticker)
+            if info:
+                return info
+
+        # 2. Twelve Data
+        if settings.TWELVE_DATA_API_KEY:
+            info = await cls._fetch_twelve_data_info(ticker)
+            if info:
+                return info
+
+        # 3. yfinance
         try:
             loop = asyncio.get_event_loop()
-            return await loop.run_in_executor(None, cls._fetch_info_yf, ticker)
+            info = await loop.run_in_executor(None, cls._fetch_info_yf, ticker)
+            if info:
+                return info
         except Exception as e:
-            logger.warning(f"get_security_info {ticker}: {e}")
-            return None
+            logger.warning(f"[yfinance-info] {ticker}: {e}")
+
+        logger.warning(f"[info-miss] {ticker}: no security info from any provider")
+        return None
 
     @classmethod
     async def invalidate(cls, ticker: str) -> None:
@@ -256,6 +275,94 @@ class PriceService:
             return price
         except Exception as e:
             logger.warning(f"[twelvedata] {ticker} error: {e}")
+            return None
+
+    # ─────────────────────────────────────────────────────────────
+    # Alpha Vantage — security info
+    # ─────────────────────────────────────────────────────────────
+
+    @classmethod
+    async def _fetch_alpha_vantage_info(cls, ticker: str) -> Optional[dict]:
+        url = "https://www.alphavantage.co/query"
+        params = {
+            "function": "OVERVIEW",
+            "symbol": ticker,
+            "apikey": settings.ALPHA_VANTAGE_API_KEY,
+        }
+        try:
+            async with httpx.AsyncClient(timeout=10) as client:
+                r = await client.get(url, params=params)
+                r.raise_for_status()
+                data = r.json()
+
+            if not data or "Symbol" not in data:
+                info = data.get("Information", "") or data.get("Note", "")
+                if info:
+                    logger.warning(f"[alphavantage-info] {ticker}: {info[:80]}")
+                return None
+
+            result = {
+                "ticker": data.get("Symbol", ticker).upper(),
+                "name": data.get("Name") or data.get("AssetType") or ticker,
+                "exchange": data.get("Exchange"),
+                "currency": data.get("Currency", "USD"),
+                "sector": data.get("Sector"),
+                "industry": data.get("Industry"),
+                # "description": data.get("Description"),
+            }
+            logger.debug(f"[alphavantage-info] {ticker} = {result['name']}")
+            return result
+        except Exception as e:
+            logger.warning(f"[alphavantage-info] {ticker} error: {e}")
+            return None
+
+    # ─────────────────────────────────────────────────────────────
+    # Twelve Data — security info
+    # ─────────────────────────────────────────────────────────────
+
+    @classmethod
+    async def _fetch_twelve_data_info(cls, ticker: str) -> Optional[dict]:
+        url = "https://api.twelvedata.com/stocks"
+        params = {
+            "symbol": ticker,
+            "apikey": settings.TWELVE_DATA_API_KEY,
+        }
+        try:
+            async with httpx.AsyncClient(timeout=10) as client:
+                r = await client.get(url, params=params)
+                r.raise_for_status()
+                data = r.json()
+
+            if data.get("status") == "error":
+                logger.warning(f"[twelvedata-info] {ticker}: {data.get('message', 'no data')}")
+                return None
+
+            # Response is a list of matches or a single dict
+            stock = None
+            if isinstance(data, list) and data:
+                stock = data[0]
+            elif isinstance(data, dict) and "data" in data:
+                items = data["data"]
+                if isinstance(items, list) and items:
+                    stock = items[0]
+            elif isinstance(data, dict) and "symbol" in data:
+                stock = data
+
+            if not stock:
+                return None
+
+            result = {
+                "ticker": stock.get("symbol", ticker).upper(),
+                "name": stock.get("name") or ticker,
+                "exchange": stock.get("exchange"),
+                "currency": stock.get("currency", "USD"),
+                "sector": stock.get("sector"),
+                "industry": stock.get("industry"),
+            }
+            logger.debug(f"[twelvedata-info] {ticker} = {result['name']}")
+            return result
+        except Exception as e:
+            logger.warning(f"[twelvedata-info] {ticker} error: {e}")
             return None
 
     # ─────────────────────────────────────────────────────────────
