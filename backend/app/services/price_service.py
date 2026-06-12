@@ -102,7 +102,7 @@ class PriceService:
 
     @classmethod
     async def get_historical_price(cls, ticker: str, target_date: date) -> Optional[float]:
-        """Historical close price — Redis cached, yfinance backed."""
+        """Historical close price — multi-provider chain, Redis cached for 24h."""
         ticker = ticker.upper()
         key = f"hist:{ticker}:{target_date.isoformat()}"
 
@@ -110,13 +110,30 @@ class PriceService:
         if cached is not None:
             return cached
 
+        # 1. Alpha Vantage
+        if settings.ALPHA_VANTAGE_API_KEY:
+            price = await cls._fetch_alpha_vantage_historical(ticker, target_date)
+            if price:
+                await cls._redis_set_raw(key, price, ttl=86400)
+                return price
+
+        # 2. Twelve Data
+        if settings.TWELVE_DATA_API_KEY:
+            price = await cls._fetch_twelve_data_historical(ticker, target_date)
+            if price:
+                await cls._redis_set_raw(key, price, ttl=86400)
+                return price
+
+        # 3. yfinance
         price = await asyncio.get_event_loop().run_in_executor(
             None, cls._fetch_historical_yf, ticker, target_date
         )
         if price:
-            # Historical prices don't change — cache for 24h
             await cls._redis_set_raw(key, price, ttl=86400)
-        return price
+            return price
+
+        logger.warning(f"[hist-miss] {ticker} {target_date}: no price from any provider")
+        return None
 
     @classmethod
     async def get_security_info(cls, ticker: str) -> Optional[dict]:
@@ -268,6 +285,84 @@ class PriceService:
             return None
         except Exception as e:
             logger.debug(f"_fetch_price_yf {ticker}: {e}")
+            return None
+        
+    # ─────────────────────────────────────────────────────────────
+    # Alpha Vantage — historical
+    # ─────────────────────────────────────────────────────────────
+
+    @classmethod
+    async def _fetch_alpha_vantage_historical(cls, ticker: str, target_date: date) -> Optional[float]:
+        url = "https://www.alphavantage.co/query"
+        params = {
+            "function": "TIME_SERIES_DAILY",
+            "symbol": ticker,
+            "outputsize": "full",
+            "apikey": settings.ALPHA_VANTAGE_API_KEY,
+        }
+        try:
+            async with httpx.AsyncClient(timeout=10) as client:
+                r = await client.get(url, params=params)
+                r.raise_for_status()
+                data = r.json()
+
+            series = data.get("Time Series (Daily)", {})
+            if not series:
+                info = data.get("Information", "") or data.get("Note", "")
+                if info:
+                    logger.warning(f"[alphavantage-hist] {ticker}: {info[:80]}")
+                return None
+
+            # Find exact date, or nearest earlier trading day (within 5 days)
+            for offset in range(6):
+                d = (target_date - timedelta(days=offset)).isoformat()
+                if d in series:
+                    price = float(series[d]["4. close"])
+                    logger.debug(f"[alphavantage-hist] {ticker} {target_date} -> {d} = {price}")
+                    return price
+            return None
+        except Exception as e:
+            logger.warning(f"[alphavantage-hist] {ticker} error: {e}")
+            return None
+
+    # ─────────────────────────────────────────────────────────────
+    # Twelve Data — historical
+    # ─────────────────────────────────────────────────────────────
+
+    @classmethod
+    async def _fetch_twelve_data_historical(cls, ticker: str, target_date: date) -> Optional[float]:
+        url = "https://api.twelvedata.com/time_series"
+        # Request a small window ending at target_date so we get the closest
+        # earlier trading day if target_date itself is a weekend/holiday
+        start = (target_date - timedelta(days=7)).isoformat()
+        end = target_date.isoformat()
+        params = {
+            "symbol": ticker,
+            "interval": "1day",
+            "start_date": start,
+            "end_date": end,
+            "apikey": settings.TWELVE_DATA_API_KEY,
+        }
+        try:
+            async with httpx.AsyncClient(timeout=10) as client:
+                r = await client.get(url, params=params)
+                r.raise_for_status()
+                data = r.json()
+
+            values = data.get("values")
+            if not values:
+                logger.warning(f"[twelvedata-hist] {ticker}: {data.get('message', 'no data')}")
+                return None
+
+            # values are returned newest-first; take the most recent <= target_date
+            for v in values:
+                if v["datetime"] <= end:
+                    price = float(v["close"])
+                    logger.debug(f"[twelvedata-hist] {ticker} {target_date} -> {v['datetime']} = {price}")
+                    return price
+            return None
+        except Exception as e:
+            logger.warning(f"[twelvedata-hist] {ticker} error: {e}")
             return None
 
     @staticmethod
