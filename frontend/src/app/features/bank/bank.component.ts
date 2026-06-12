@@ -70,7 +70,7 @@ const TX_BADGES: Record<string, string> = {
         } @else {
           <div class="accounts-grid">
             @for (acc of accounts(); track acc.id) {
-              <div class="account-card card" [class.active]="selectedAccountId() === acc.id" (click)="selectAccount(acc)">
+              <div class="account-card card" [class.active]="selectedAccountId() === acc.id" [class.deleting]="deletingAccountId() === acc.id" (click)="selectAccount(acc)">
                 <div class="ac-header">
                   <div class="ac-name">{{ acc.name }}</div>
                   <div class="flex gap-2 items-center">
@@ -94,6 +94,30 @@ const TX_BADGES: Record<string, string> = {
                 <div class="ac-actions">
                   <button class="btn btn-ghost btn-sm" (click)="openTxModal(acc); $event.stopPropagation()">+ Transaction</button>
                   <button class="btn btn-ghost btn-sm" (click)="openRateModal(acc); $event.stopPropagation()">Set Rate</button>
+                  <button
+                    class="btn-delete-account"
+                    [class.confirming]="confirmDeleteAccountId() === acc.id"
+                    [disabled]="deletingAccountId() === acc.id"
+                    (click)="onDeleteAccountClick(acc); $event.stopPropagation()"
+                    [title]="confirmDeleteAccountId() === acc.id ? 'Click again to confirm' : 'Delete account'"
+                  >
+                    @if (deletingAccountId() === acc.id) {
+                      <div class="spinner" style="width:13px;height:13px;border-width:2px"></div>
+                    } @else if (confirmDeleteAccountId() === acc.id) {
+                      <svg width="13" height="13" fill="none" stroke="currentColor" stroke-width="2.5" viewBox="0 0 24 24">
+                        <polyline points="20 6 9 17 4 12"/>
+                      </svg>
+                      <span>Confirm</span>
+                    } @else {
+                      <svg width="13" height="13" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24">
+                        <polyline points="3 6 5 6 21 6"/>
+                        <path d="M19 6l-1 14a2 2 0 0 1-2 2H8a2 2 0 0 1-2-2L5 6"/>
+                        <path d="M10 11v6M14 11v6"/>
+                        <path d="M9 6V4a1 1 0 0 1 1-1h4a1 1 0 0 1 1 1v2"/>
+                      </svg>
+                      <span>Delete</span>
+                    }
+                  </button>
                 </div>
               </div>
             }
@@ -368,7 +392,7 @@ const TX_BADGES: Record<string, string> = {
       </div>
     }
 
-    <!-- Delete error toast -->
+    <!-- Error toast -->
     @if (deleteError()) {
       <div class="toast toast-error">
         <svg width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24">
@@ -384,12 +408,13 @@ const TX_BADGES: Record<string, string> = {
     .account-card { padding: 22px; display: flex; flex-direction: column; gap: 8px; cursor: pointer; transition: all var(--transition);
       &:hover { border-color: var(--border-active); box-shadow: var(--shadow-elevated); }
       &.active { border-color: var(--accent-border); box-shadow: var(--shadow-accent); }
+      &.deleting { opacity: 0.4; pointer-events: none; }
     }
     .ac-header { display: flex; align-items: center; justify-content: space-between; }
     .ac-name { font-family: var(--font-display); font-size: 15px; font-weight: 700; }
     .ac-balance { font-size: 28px; font-weight: 500; letter-spacing: -0.5px; margin: 4px 0; }
     .ac-rate { display: flex; align-items: center; gap: 5px; font-size: 12px; color: var(--green); }
-    .ac-actions { display: flex; gap: 8px; margin-top: 8px; padding-top: 14px; border-top: 1px solid var(--border); }
+    .ac-actions { display: flex; gap: 8px; margin-top: 8px; padding-top: 14px; border-top: 1px solid var(--border); align-items: center; }
     .detail-header { display: flex; align-items: center; justify-content: space-between; margin-bottom: 16px; h2 { font-family: var(--font-display); font-size: 16px; } }
     .num-col { text-align: right; }
     .date-cell { color: var(--text-secondary); font-size: 13px; white-space: nowrap; }
@@ -400,7 +425,7 @@ const TX_BADGES: Record<string, string> = {
     /* Row deleting state */
     tr.deleting td { opacity: 0.4; transition: opacity 0.2s; }
 
-    /* Delete button */
+    /* Delete button (transaction row) */
     .action-cell { width: 80px; text-align: right; padding-right: 12px !important; }
     .btn-delete {
       display: inline-flex; align-items: center; gap: 5px;
@@ -409,6 +434,27 @@ const TX_BADGES: Record<string, string> = {
       border: 1px solid transparent; cursor: pointer;
       background: transparent; color: var(--text-muted);
       transition: all var(--transition); white-space: nowrap;
+      &:hover:not(:disabled):not(.confirming) {
+        background: var(--red-dim); color: var(--red);
+        border-color: rgba(248,113,113,0.25);
+      }
+      &.confirming {
+        background: var(--red-dim); color: var(--red);
+        border-color: rgba(248,113,113,0.4);
+        animation: pulse-border 1s ease-in-out infinite;
+      }
+      &:disabled { opacity: 0.5; cursor: not-allowed; }
+    }
+
+    /* Delete button (account card) */
+    .btn-delete-account {
+      display: inline-flex; align-items: center; gap: 5px;
+      padding: 5px 12px; border-radius: var(--radius-sm);
+      font-size: 12px; font-weight: 500;
+      border: 1px solid transparent; cursor: pointer;
+      background: transparent; color: var(--text-muted);
+      transition: all var(--transition); white-space: nowrap;
+      margin-left: auto;
       &:hover:not(:disabled):not(.confirming) {
         background: var(--red-dim); color: var(--red);
         border-color: rgba(248,113,113,0.25);
@@ -449,8 +495,11 @@ export class BankComponent implements OnInit {
   fxRate = signal(450);
   deletingTxId = signal<number | null>(null);
   confirmBankTxId = signal<number | null>(null);
+  deletingAccountId = signal<number | null>(null);
+  confirmDeleteAccountId = signal<number | null>(null);
   deleteError = signal('');
   private confirmTimer: ReturnType<typeof setTimeout> | null = null;
+  private confirmAccountTimer: ReturnType<typeof setTimeout> | null = null;
 
   // Modals
   showCreateModal = false;
@@ -585,6 +634,47 @@ export class BankComponent implements OnInit {
       error: (e) => {
         this.deleteError.set(e.error?.detail || 'Failed to delete transaction.');
         this.deletingTxId.set(null);
+        setTimeout(() => this.deleteError.set(''), 5000);
+      }
+    });
+  }
+
+  onDeleteAccountClick(acc: BankAccount): void {
+    if (this.confirmDeleteAccountId() === acc.id) {
+      if (this.confirmAccountTimer) clearTimeout(this.confirmAccountTimer);
+      this.confirmDeleteAccountId.set(null);
+      this.executeDeleteAccount(acc);
+    } else {
+      if (this.confirmAccountTimer) clearTimeout(this.confirmAccountTimer);
+      this.confirmDeleteAccountId.set(acc.id);
+      this.confirmAccountTimer = setTimeout(() => {
+        this.confirmDeleteAccountId.set(null);
+      }, 3000);
+    }
+  }
+
+  private executeDeleteAccount(acc: BankAccount): void {
+    this.deletingAccountId.set(acc.id);
+    this.deleteError.set('');
+    this.api.deleteBankAccount(acc.id).subscribe({
+      next: () => {
+        this.accounts.update(accs => accs.filter(a => a.id !== acc.id));
+        this.deletingAccountId.set(null);
+
+        // If the deleted account was selected, select another or clear
+        if (this.selectedAccountId() === acc.id) {
+          const remaining = this.accounts();
+          if (remaining.length > 0) {
+            this.selectAccount(remaining[0]);
+          } else {
+            this.selectedAccountId.set(null);
+            this.selectedTxs.set([]);
+          }
+        }
+      },
+      error: (e) => {
+        this.deleteError.set(e.error?.detail || 'Failed to delete account.');
+        this.deletingAccountId.set(null);
         setTimeout(() => this.deleteError.set(''), 5000);
       }
     });

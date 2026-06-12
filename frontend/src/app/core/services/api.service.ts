@@ -85,6 +85,9 @@ export class ApiService {
   updateBankAccount(id: number, data: Partial<BankAccount>): Observable<BankAccount> {
     return this.http.patch<BankAccount>(`${API}/bank/accounts/${id}`, data);
   }
+  deleteBankAccount(id: number): Observable<void> {
+    return this.http.delete<void>(`${API}/bank/accounts/${id}`);
+  }
   getBankRates(accountId: number): Observable<BankInterestRate[]> {
     return this.http.get<BankInterestRate[]>(`${API}/bank/accounts/${accountId}/rates`);
   }
