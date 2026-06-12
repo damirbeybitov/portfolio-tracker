@@ -209,9 +209,25 @@ class PortfolioService:
     async def _tx_to_response(db: AsyncSession, tx: Transaction) -> TransactionResponse:
         result = await db.execute(select(Security).where(Security.id == tx.security_id))
         security = result.scalar_one()
-        data = TransactionResponse.model_validate(tx)
-        data.security = SecurityResponse.model_validate(security)
-        return data
+        
+        return TransactionResponse(
+            id=tx.id,
+            portfolio_id=tx.portfolio_id,
+            security=SecurityResponse.model_validate(security),
+            type=tx.type,
+            date=tx.date,
+            quantity=tx.quantity,
+            price_usd=tx.price_usd,
+            price_kzt=tx.price_kzt,
+            total_usd=tx.total_usd,
+            total_kzt=tx.total_kzt,
+            fx_rate_usd_kzt=tx.fx_rate_usd_kzt,
+            commission_usd=tx.commission_usd,
+            commission_kzt=tx.commission_kzt,
+            split_ratio=tx.split_ratio,
+            notes=tx.notes,
+            created_at=tx.created_at,
+        )
 
     @staticmethod
     async def _update_position(
