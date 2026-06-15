@@ -4,7 +4,8 @@ import { FormsModule } from '@angular/forms';
 import { ApiService } from '../../core/services/api.service';
 import {
   BankAccount, BankAccountCreate, BankTransaction, BankTransactionCreate,
-  BankInterestRate, BankTransactionType, AccountCurrency
+  BankInterestRate, BankTransactionType, AccountCurrency,
+  UserSettings
 } from '../../core/models';
 
 const TX_BADGES: Record<string, string> = {
@@ -60,7 +61,7 @@ const TX_BADGES: Record<string, string> = {
         </div>
 
         <!-- Accounts grid -->
-        @if (accounts().length === 0) {
+        @if (visibleAccounts().length === 0) {
           <div class="card empty-state">
             <div class="empty-icon">🏦</div>
             <div class="empty-title">No bank accounts</div>
@@ -69,7 +70,7 @@ const TX_BADGES: Record<string, string> = {
           </div>
         } @else {
           <div class="accounts-grid">
-            @for (acc of accounts(); track acc.id) {
+            @for (acc of visibleAccounts(); track acc.id) {
               <div class="account-card card" [class.active]="selectedAccountId() === acc.id" [class.deleting]="deletingAccountId() === acc.id" (click)="selectAccount(acc)">
                 <div class="ac-header">
                   <div class="ac-name">{{ acc.name }}</div>
@@ -292,7 +293,7 @@ const TX_BADGES: Record<string, string> = {
                 <label>Related Account</label>
                 <select class="form-control" [(ngModel)]="newTx.related_account_id">
                   <option [value]="undefined">None</option>
-                  @for (acc of accounts(); track acc.id) {
+                  @for (acc of visibleAccounts(); track acc.id) {
                     @if (acc.id !== txTargetAccount?.id) {
                       <option [value]="acc.id">{{ acc.name }} ({{ acc.currency }})</option>
                     }
@@ -492,6 +493,7 @@ export class BankComponent implements OnInit {
   selectedAccountId = signal<number | null>(null);
   selectedTxs = signal<BankTransaction[]>([]);
   currentRates = signal<BankInterestRate[]>([]);
+  settings = signal<UserSettings>({ hide_inactive_bank_accounts: false });
   fxRate = signal(450);
   deletingTxId = signal<number | null>(null);
   confirmBankTxId = signal<number | null>(null);
@@ -500,6 +502,8 @@ export class BankComponent implements OnInit {
   deleteError = signal('');
   private confirmTimer: ReturnType<typeof setTimeout> | null = null;
   private confirmAccountTimer: ReturnType<typeof setTimeout> | null = null;
+  private settingsLoaded = false;
+  private accountsLoaded = false;
 
   // Modals
   showCreateModal = false;
@@ -525,19 +529,40 @@ export class BankComponent implements OnInit {
   newRate = { rate_percent: 0, effective_from: new Date().toISOString().split('T')[0], notes: '' };
   fxForm = { date: new Date().toISOString().split('T')[0], usd_to_kzt: 0 };
 
-  totalKzt = () => this.accounts().filter(a => a.currency === 'KZT').reduce((s, a) => s + +a.balance, 0);
-  totalUsd = () => this.accounts().filter(a => a.currency === 'USD').reduce((s, a) => s + +a.balance, 0);
+  visibleAccounts = () =>
+    this.settings().hide_inactive_bank_accounts
+      ? this.accounts().filter(a => a.is_active)
+      : this.accounts();
+
+  totalKzt = () => this.visibleAccounts().filter(a => a.currency === 'KZT').reduce((s, a) => s + +a.balance, 0);
+  totalUsd = () => this.visibleAccounts().filter(a => a.currency === 'USD').reduce((s, a) => s + +a.balance, 0);
   totalUsdEquiv = () => this.totalUsd() + (this.totalKzt() / this.fxRate());
   selectedAccount = () => this.accounts().find(a => a.id === this.selectedAccountId()) || null;
 
   constructor(private api: ApiService) {}
 
   ngOnInit(): void {
+    this.api.getSettings().subscribe({
+      next: (s) => {
+        this.settings.set(s);
+        this.settingsLoaded = true;
+        this.maybeReselect();
+      },
+      error: () => {
+        this.settingsLoaded = true; // still mark as "done" so the other branch can proceed
+        this.maybeReselect();
+      }
+    });
+
     this.api.listBankAccounts().subscribe(accs => {
       this.accounts.set(accs);
       this.loading.set(false);
       if (accs.length > 0) this.selectAccount(accs[0]);
+
+      this.accountsLoaded = true;
+      this.maybeReselect();
     });
+
     this.api.getFxRate().subscribe(fx => {
       this.fxRate.set(+fx.usd_to_kzt);
       this.fxForm.usd_to_kzt = +fx.usd_to_kzt;
@@ -552,6 +577,15 @@ export class BankComponent implements OnInit {
       this.selectedTxs.set(txs);
       this.txLoading.set(false);
     });
+  }
+
+  private maybeReselect(): void {
+    const visible = this.visibleAccounts();
+    const current = this.selectedAccountId();
+    if (current !== null && !visible.some(a => a.id === current)) {
+      if (visible.length > 0) this.selectAccount(visible[0]);
+      else { this.selectedAccountId.set(null); this.selectedTxs.set([]); }
+    }
   }
 
   openCreateAccount(): void {

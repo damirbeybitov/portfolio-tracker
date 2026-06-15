@@ -5,7 +5,9 @@ import {
   AuthResponse, TokenResponse, Portfolio, PortfolioSummary, Transaction, TransactionCreate,
   Security, PortfolioAnalytics, BankSummary, OverallSummary,
   BankAccount, BankAccountCreate, BankInterestRate, BankTransaction, BankTransactionCreate,
-  FxRate, UserResponse
+  FxRate, UserResponse,
+  UserSettings,
+  UserSettingsUpdate
 } from '../models';
 
 const API = '/api/v1';
@@ -109,5 +111,13 @@ export class ApiService {
   }
   setFxRate(data: { date: string; usd_to_kzt: number }): Observable<FxRate> {
     return this.http.post<FxRate>(`${API}/bank/fx`, data);
+  }
+
+  // Settings
+  getSettings(): Observable<UserSettings> {
+    return this.http.get<UserSettings>(`${API}/settings`);
+  }
+  updateSettings(data: UserSettingsUpdate): Observable<UserSettings> {
+    return this.http.patch<UserSettings>(`${API}/settings`, data);
   }
 }

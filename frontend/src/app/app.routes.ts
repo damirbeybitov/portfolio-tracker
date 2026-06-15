@@ -35,7 +35,11 @@ export const routes: Routes = [
       {
         path: 'analytics/:id',
         loadComponent: () => import('./features/analytics/analytics.component').then(m => m.AnalyticsComponent)
-      }
+      },
+      {
+        path: 'settings',
+        loadComponent: () => import('./features/settings/settings.component').then(m => m.SettingsComponent)
+      },
     ]
   },
   { path: '**', redirectTo: '' }

@@ -3,7 +3,7 @@ import { CommonModule } from '@angular/common';
 import { RouterLink } from '@angular/router';
 import { FormsModule } from '@angular/forms';
 import { ApiService } from '../../core/services/api.service';
-import { Portfolio, PortfolioSummary, BankAccount, OverallSummary } from '../../core/models';
+import { Portfolio, PortfolioSummary, BankAccount, OverallSummary, UserSettings } from '../../core/models';
 
 @Component({
   selector: 'app-dashboard',
@@ -160,13 +160,13 @@ import { Portfolio, PortfolioSummary, BankAccount, OverallSummary } from '../../
         }
 
         <!-- Bank accounts -->
-        @if (bankAccounts().length > 0) {
+        @if (visibleBankAccounts().length > 0) {
           <div class="section-header">
             <h2 class="section-title">Bank Accounts</h2>
             <a routerLink="/bank" class="btn btn-ghost btn-sm">View all →</a>
           </div>
           <div class="bank-grid">
-            @for (acc of bankAccounts(); track acc.id) {
+            @for (acc of visibleBankAccounts(); track acc.id) {
               <a routerLink="/bank" class="bcard card">
                 <div class="bcard-head">
                   <div class="bcard-icon" [class.kzt]="acc.currency==='KZT'" [class.usd]="acc.currency==='USD'">
@@ -375,6 +375,7 @@ export class DashboardComponent implements OnInit {
   portfolios = signal<Portfolio[]>([]);
   summaries = signal<Record<number, PortfolioSummary>>({});
   bankAccounts = signal<BankAccount[]>([]);
+  settingsData = signal<UserSettings>({ hide_inactive_bank_accounts: false });
   fxRate = signal(0);
   showCreatePortfolio = false;
   createLoading = false;
@@ -402,8 +403,17 @@ export class DashboardComponent implements OnInit {
 
   ngOnInit(): void { this.loadAll(); }
 
+  visibleBankAccounts = () =>
+    this.settingsData().hide_inactive_bank_accounts
+      ? this.bankAccounts().filter(a => a.is_active)
+      : this.bankAccounts();
+
   loadAll(): void {
     this.loading.set(true);
+    this.api.getSettings().subscribe({
+      next: (s) => { this.settingsData.set(s); this.recomputeBankTotal(); },
+      error: () => {}
+    });
     this.api.listPortfolios().subscribe(portfolios => {
       this.portfolios.set(portfolios);
       if (portfolios.length === 0) this.loading.set(false);
@@ -411,16 +421,21 @@ export class DashboardComponent implements OnInit {
     });
     this.api.listBankAccounts().subscribe(accounts => {
       this.bankAccounts.set(accounts);
-      const usdEquiv = accounts.reduce((sum, a) => {
-        if (a.currency === 'USD') return sum + +a.balance;
-        return sum + (+a.balance / (this.fxRate() || 475));
-      }, 0);
-      this.totalBankUsdEquiv.set(usdEquiv);
+      this.recomputeBankTotal();
     });
     this.api.getFxRate().subscribe(fx => {
       this.fxRate.set(+fx.usd_to_kzt);
+      this.recomputeBankTotal();
     });
     setTimeout(() => this.loading.set(false), 1200);
+  }
+
+  private recomputeBankTotal(): void {
+    const usdEquiv = this.visibleBankAccounts().reduce((sum, a) => {
+      if (a.currency === 'USD') return sum + +a.balance;
+      return sum + (+a.balance / (this.fxRate() || 475));
+    }, 0);
+    this.totalBankUsdEquiv.set(usdEquiv);
   }
 
   refreshAll(): void { this.loadAll(); }

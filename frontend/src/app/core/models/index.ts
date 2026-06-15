@@ -225,3 +225,11 @@ export interface FxRate {
   date: string;
   usd_to_kzt: number;
 }
+
+export interface UserSettings {
+  hide_inactive_bank_accounts: boolean;
+}
+
+export interface UserSettingsUpdate {
+  hide_inactive_bank_accounts?: boolean;
+}
