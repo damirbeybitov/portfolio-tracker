@@ -7,6 +7,7 @@ from app.db.session import engine
 from app.db.base import Base
 from app.db.redis import get_redis, close_redis
 from app.api.v1.router import api_router
+from app.core.logging_config import configure_logging
 
 
 @asynccontextmanager
@@ -20,6 +21,7 @@ async def lifespan(app: FastAPI):
     await engine.dispose()
     await close_redis()
 
+configure_logging()
 
 app = FastAPI(
     title="Portfolio Tracker API",
