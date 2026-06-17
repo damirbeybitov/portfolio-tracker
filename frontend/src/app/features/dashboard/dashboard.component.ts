@@ -3,6 +3,7 @@ import { CommonModule } from '@angular/common';
 import { RouterLink } from '@angular/router';
 import { FormsModule } from '@angular/forms';
 import { ApiService } from '../../core/services/api.service';
+import { PortfolioStoreService } from '../../core/services/portfolio-store.service';
 import { Portfolio, PortfolioSummary, BankAccount, OverallSummary, UserSettings } from '../../core/models';
 
 @Component({
@@ -94,7 +95,7 @@ import { Portfolio, PortfolioSummary, BankAccount, OverallSummary, UserSettings 
           <div class="portfolio-grid" style="margin-bottom:32px">
             @for (p of portfolios(); track p.id) {
               @if (summaries()[p.id]; as s) {
-                <div class="pcard card" [class.profit]="s.total_profit_usd >= 0" [class.loss]="s.total_profit_usd < 0">
+                <div class="pcard card" [class.profit]="s.total_profit_usd >= 0" [class.loss]="s.total_profit_usd < 0" [class.deleting]="deletingPortfolioId() === p.id">
                   <div class="pcard-head">
                     <div>
                       <div class="pcard-name">{{ p.name }}</div>
@@ -139,6 +140,29 @@ import { Portfolio, PortfolioSummary, BankAccount, OverallSummary, UserSettings 
                   }
 
                   <div class="pcard-actions">
+                    <button
+                      class="btn-delete-portfolio"
+                      [class.confirming]="confirmDeletePortfolioId() === p.id"
+                      [disabled]="deletingPortfolioId() === p.id"
+                      (click)="onDeletePortfolioClick(p); $event.stopPropagation()"
+                      [title]="confirmDeletePortfolioId() === p.id ? 'Click again to confirm — this also deletes all transactions' : 'Delete portfolio'"
+                    >
+                      @if (deletingPortfolioId() === p.id) {
+                        <div class="spinner" style="width:13px;height:13px;border-width:2px"></div>
+                      } @else if (confirmDeletePortfolioId() === p.id) {
+                        <svg width="13" height="13" fill="none" stroke="currentColor" stroke-width="2.5" viewBox="0 0 24 24">
+                          <polyline points="20 6 9 17 4 12"/>
+                        </svg>
+                        <span>Confirm</span>
+                      } @else {
+                        <svg width="13" height="13" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24">
+                          <polyline points="3 6 5 6 21 6"/>
+                          <path d="M19 6l-1 14a2 2 0 0 1-2 2H8a2 2 0 0 1-2-2L5 6"/>
+                          <path d="M10 11v6M14 11v6"/>
+                          <path d="M9 6V4a1 1 0 0 1 1-1h4a1 1 0 0 1 1 1v2"/>
+                        </svg>
+                      }
+                    </button>
                     <a [routerLink]="['/analytics', p.id]" class="btn btn-ghost btn-sm">Analytics</a>
                     <a [routerLink]="['/portfolio', p.id]" class="btn btn-secondary btn-sm">View →</a>
                   </div>
@@ -249,6 +273,17 @@ import { Portfolio, PortfolioSummary, BankAccount, OverallSummary, UserSettings 
         </div>
       </div>
     }
+
+    <!-- Error toast -->
+    @if (deletePortfolioError()) {
+      <div class="toast toast-error">
+        <svg width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24">
+          <circle cx="12" cy="12" r="10"/><line x1="12" y1="8" x2="12" y2="12"/><line x1="12" y1="16" x2="12.01" y2="16"/>
+        </svg>
+        {{ deletePortfolioError() }}
+        <button class="toast-close" (click)="deletePortfolioError.set('')">✕</button>
+      </div>
+    }
   `,
   styles: [`
     /* Hero card */
@@ -289,8 +324,9 @@ import { Portfolio, PortfolioSummary, BankAccount, OverallSummary, UserSettings 
     .pcard {
       padding: 24px; display: flex; flex-direction: column; gap: 6px;
       cursor: default;
-      transition: border-color var(--transition), box-shadow var(--transition);
+      transition: border-color var(--transition), box-shadow var(--transition), opacity var(--transition);
       &:hover { border-color: var(--border-active); box-shadow: var(--shadow-elevated); }
+      &.deleting { opacity: 0.4; pointer-events: none; }
     }
     .pcard-head { display: flex; align-items: flex-start; justify-content: space-between; margin-bottom: 8px; }
     .pcard-name { font-family: var(--font-display); font-size: 15px; font-weight: 700; }
@@ -313,8 +349,33 @@ import { Portfolio, PortfolioSummary, BankAccount, OverallSummary, UserSettings 
     .legend-tick { font-family: var(--font-mono); font-weight: 600; color: var(--text-primary); }
     .legend-pct { color: var(--text-muted); }
 
-    .pcard-actions { display: flex; gap: 8px; margin-top: 12px; padding-top: 16px; border-top: 1px solid var(--border); justify-content: flex-end; }
+    .pcard-actions { display: flex; gap: 8px; margin-top: 12px; padding-top: 16px; border-top: 1px solid var(--border); justify-content: flex-end; align-items: center; }
     .loading-card { align-items: flex-start; min-height: 160px; }
+
+    /* Delete portfolio button */
+    .btn-delete-portfolio {
+      display: inline-flex; align-items: center; gap: 5px;
+      padding: 5px 10px; border-radius: var(--radius-sm);
+      font-size: 12px; font-weight: 500;
+      border: 1px solid transparent; cursor: pointer;
+      background: transparent; color: var(--text-muted);
+      transition: all var(--transition); white-space: nowrap;
+      margin-right: auto;
+      &:hover:not(:disabled):not(.confirming) {
+        background: var(--red-dim); color: var(--red);
+        border-color: rgba(248,113,113,0.25);
+      }
+      &.confirming {
+        background: var(--red-dim); color: var(--red);
+        border-color: rgba(248,113,113,0.4);
+        animation: pulse-border 1s ease-in-out infinite;
+      }
+      &:disabled { opacity: 0.5; cursor: not-allowed; }
+    }
+    @keyframes pulse-border {
+      0%, 100% { border-color: rgba(248,113,113,0.4); }
+      50% { border-color: rgba(248,113,113,0.8); }
+    }
 
     /* Add card */
     .add-card {
@@ -362,6 +423,19 @@ import { Portfolio, PortfolioSummary, BankAccount, OverallSummary, UserSettings 
       animation: spin 0.8s linear infinite;
     }
 
+    /* Toast */
+    .toast {
+      position: fixed; bottom: 24px; right: 24px; z-index: 9999;
+      display: flex; align-items: center; gap: 10px;
+      padding: 12px 16px; border-radius: var(--radius);
+      font-size: 13px; font-weight: 500;
+      box-shadow: var(--shadow-elevated);
+      animation: slideIn 0.2s ease;
+    }
+    .toast-error { background: var(--bg-elevated); border: 1px solid rgba(248,113,113,0.4); color: var(--red); }
+    .toast-close { background: none; border: none; cursor: pointer; color: inherit; opacity: 0.7; padding: 0; margin-left: 4px; font-size: 14px; &:hover { opacity: 1; } }
+    @keyframes slideIn { from { opacity: 0; transform: translateY(8px); } to { opacity: 1; transform: translateY(0); } }
+
     @media (max-width: 900px) {
       .hero-inner { gap: 24px; }
       .hero-left .hero-value { font-size: 32px; }
@@ -382,6 +456,12 @@ export class DashboardComponent implements OnInit {
   createError = '';
   newPortfolio = { name: '', description: '', currency: 'USD' };
 
+  // Delete portfolio — two-click confirm, mirrors the bank account pattern
+  deletingPortfolioId = signal<number | null>(null);
+  confirmDeletePortfolioId = signal<number | null>(null);
+  deletePortfolioError = signal('');
+  private confirmPortfolioTimer: ReturnType<typeof setTimeout> | null = null;
+
   today = new Date().toLocaleDateString('en-US', { weekday: 'long', year: 'numeric', month: 'long', day: 'numeric' });
 
   totalPortfolioUsd = signal(0);
@@ -399,7 +479,7 @@ export class DashboardComponent implements OnInit {
   ];
   private colorMap: Map<string, string> = new Map();
 
-  constructor(private api: ApiService) {}
+  constructor(private api: ApiService, private portfolioStore: PortfolioStoreService) {}
 
   ngOnInit(): void { this.loadAll(); }
 
@@ -464,6 +544,7 @@ export class DashboardComponent implements OnInit {
     this.api.createPortfolio(this.newPortfolio).subscribe({
       next: (p) => {
         this.portfolios.update(prev => [...prev, p]);
+        this.portfolioStore.add(p);
         this.showCreatePortfolio = false; this.createLoading = false;
         this.newPortfolio = { name: '', description: '', currency: 'USD' };
         this.loadSummary(p.id);
@@ -471,6 +552,48 @@ export class DashboardComponent implements OnInit {
       error: (e) => {
         this.createError = e.error?.detail || 'Failed to create portfolio';
         this.createLoading = false;
+      }
+    });
+  }
+
+  onDeletePortfolioClick(p: Portfolio): void {
+    if (this.deletingPortfolioId() !== null) return;
+
+    if (this.confirmDeletePortfolioId() === p.id) {
+      // Second click — confirmed, proceed with deletion
+      if (this.confirmPortfolioTimer) clearTimeout(this.confirmPortfolioTimer);
+      this.confirmDeletePortfolioId.set(null);
+      this.executeDeletePortfolio(p);
+    } else {
+      // First click — ask for confirmation; this is destructive (wipes
+      // every transaction and position in the portfolio too)
+      if (this.confirmPortfolioTimer) clearTimeout(this.confirmPortfolioTimer);
+      this.confirmDeletePortfolioId.set(p.id);
+      this.confirmPortfolioTimer = setTimeout(() => {
+        this.confirmDeletePortfolioId.set(null);
+      }, 3000);
+    }
+  }
+
+  private executeDeletePortfolio(p: Portfolio): void {
+    this.deletingPortfolioId.set(p.id);
+    this.deletePortfolioError.set('');
+    this.api.deletePortfolio(p.id).subscribe({
+      next: () => {
+        this.portfolios.update(list => list.filter(x => x.id !== p.id));
+        this.summaries.update(prev => {
+          const next = { ...prev };
+          delete next[p.id];
+          return next;
+        });
+        this.portfolioStore.remove(p.id);
+        this.deletingPortfolioId.set(null);
+        this.recalcTotals();
+      },
+      error: (e) => {
+        this.deletePortfolioError.set(e.error?.detail || 'Failed to delete portfolio.');
+        this.deletingPortfolioId.set(null);
+        setTimeout(() => this.deletePortfolioError.set(''), 5000);
       }
     });
   }

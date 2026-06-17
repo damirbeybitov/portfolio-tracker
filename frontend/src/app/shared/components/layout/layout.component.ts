@@ -2,8 +2,7 @@ import { Component, signal, computed } from '@angular/core';
 import { CommonModule } from '@angular/common';
 import { RouterOutlet, RouterLink, RouterLinkActive, Router } from '@angular/router';
 import { AuthService } from '../../../core/services/auth.service';
-import { ApiService } from '../../../core/services/api.service';
-import { Portfolio } from '../../../core/models';
+import { PortfolioStoreService } from '../../../core/services/portfolio-store.service';
 
 @Component({
   selector: 'app-layout',
@@ -270,21 +269,26 @@ import { Portfolio } from '../../../core/models';
 })
 export class LayoutComponent {
   sidebarCollapsed = signal(false);
-  portfolios = signal<Portfolio[]>([]);
+
   currentUser = computed(() => this.auth.currentUser());
   userInitial = computed(() => {
     const u = this.auth.currentUser();
     return u?.username?.[0]?.toUpperCase() ?? 'U';
   });
 
-  constructor(private auth: AuthService, private api: ApiService, private router: Router) {
-    this.loadPortfolios();
+  // Sourced straight from the shared store — any page that adds/removes a
+  // portfolio (Dashboard, Portfolio detail) updates this automatically, so
+  // the sidebar never goes stale after a delete.
+  get portfolios() {
+    return this.portfolioStore.portfolios;
   }
 
-  loadPortfolios(): void {
-    this.api.listPortfolios().subscribe({
-      next: (p) => this.portfolios.set(p)
-    });
+  constructor(
+    private auth: AuthService,
+    private portfolioStore: PortfolioStoreService,
+    private router: Router,
+  ) {
+    this.portfolioStore.refresh();
   }
 
   toggleSidebar(): void {

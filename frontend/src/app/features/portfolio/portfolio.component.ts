@@ -1,8 +1,9 @@
 import { Component, OnInit, signal } from '@angular/core';
 import { CommonModule, DecimalPipe, CurrencyPipe } from '@angular/common';
-import { RouterLink, ActivatedRoute } from '@angular/router';
+import { RouterLink, ActivatedRoute, Router } from '@angular/router';
 import { FormsModule } from '@angular/forms';
 import { ApiService } from '../../core/services/api.service';
+import { PortfolioStoreService } from '../../core/services/portfolio-store.service';
 import { PortfolioSummary, Position, Security, TransactionCreate, TransactionType } from '../../core/models';
 
 @Component({
@@ -42,6 +43,30 @@ import { PortfolioSummary, Position, Security, TransactionCreate, TransactionTyp
               <line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/>
             </svg>
             Add Transaction
+          </button>
+          <button
+            class="btn-delete-portfolio-detail"
+            [class.confirming]="confirmDeletePortfolio()"
+            [disabled]="deletingPortfolio()"
+            (click)="onDeletePortfolioClick()"
+            [title]="confirmDeletePortfolio() ? 'Click again to confirm — this also deletes all transactions and positions' : 'Delete this portfolio'"
+          >
+            @if (deletingPortfolio()) {
+              <span class="spinner" style="width:13px;height:13px;border-width:2px"></span>
+            } @else if (confirmDeletePortfolio()) {
+              <svg width="13" height="13" fill="none" stroke="currentColor" stroke-width="2.5" viewBox="0 0 24 24">
+                <polyline points="20 6 9 17 4 12"/>
+              </svg>
+              <span>Confirm Delete</span>
+            } @else {
+              <svg width="13" height="13" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24">
+                <polyline points="3 6 5 6 21 6"/>
+                <path d="M19 6l-1 14a2 2 0 0 1-2 2H8a2 2 0 0 1-2-2L5 6"/>
+                <path d="M10 11v6M14 11v6"/>
+                <path d="M9 6V4a1 1 0 0 1 1-1h4a1 1 0 0 1 1 1v2"/>
+              </svg>
+              <span>Delete</span>
+            }
           </button>
         </div>
       </div>
@@ -367,6 +392,17 @@ import { PortfolioSummary, Position, Security, TransactionCreate, TransactionTyp
         </div>
       </div>
     }
+
+    <!-- Delete portfolio error toast -->
+    @if (deletePortfolioError()) {
+      <div class="toast toast-error">
+        <svg width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24">
+          <circle cx="12" cy="12" r="10"/><line x1="12" y1="8" x2="12" y2="12"/><line x1="12" y1="16" x2="12.01" y2="16"/>
+        </svg>
+        {{ deletePortfolioError() }}
+        <button class="toast-close" (click)="deletePortfolioError.set('')">✕</button>
+      </div>
+    }
   `,
   styles: [`
     .back-link { font-size: 13px; color: var(--text-secondary); text-decoration: none; display: block; margin-bottom: 6px; &:hover { color: var(--accent); } }
@@ -399,6 +435,30 @@ import { PortfolioSummary, Position, Security, TransactionCreate, TransactionTyp
     @keyframes pulse-border-amber {
       0%, 100% { border-color: rgba(251,191,36,0.4); }
       50% { border-color: rgba(251,191,36,0.8); }
+    }
+
+    /* Delete portfolio (header) */
+    .btn-delete-portfolio-detail {
+      display: inline-flex; align-items: center; gap: 6px;
+      padding: 8px 16px; border-radius: var(--radius-sm);
+      font-size: 13px; font-weight: 500;
+      border: 1px solid rgba(248,113,113,0.2); cursor: pointer;
+      background: var(--red-dim); color: var(--red);
+      transition: all var(--transition); white-space: nowrap;
+      &:hover:not(:disabled):not(.confirming) {
+        background: rgba(248,113,113,0.2);
+        border-color: rgba(248,113,113,0.35);
+      }
+      &.confirming {
+        background: rgba(248,113,113,0.25);
+        border-color: rgba(248,113,113,0.5);
+        animation: pulse-border-red 1s ease-in-out infinite;
+      }
+      &:disabled { opacity: 0.6; cursor: not-allowed; }
+    }
+    @keyframes pulse-border-red {
+      0%, 100% { border-color: rgba(248,113,113,0.5); }
+      50% { border-color: rgba(248,113,113,0.9); }
     }
 
     /* Table */
@@ -460,6 +520,19 @@ import { PortfolioSummary, Position, Security, TransactionCreate, TransactionTyp
     .preview-row { display: flex; align-items: center; justify-content: space-between; font-size: 13px; color: var(--text-secondary); .num { font-size: 15px; color: var(--text-primary); font-weight: 600; } }
     .preview-total { padding-top: 8px; border-top: 1px solid var(--border); }
 
+    /* Toast */
+    .toast {
+      position: fixed; bottom: 24px; right: 24px; z-index: 9999;
+      display: flex; align-items: center; gap: 10px;
+      padding: 12px 16px; border-radius: var(--radius);
+      font-size: 13px; font-weight: 500;
+      box-shadow: var(--shadow-elevated);
+      animation: slideIn 0.2s ease;
+    }
+    .toast-error { background: var(--bg-elevated); border: 1px solid rgba(248,113,113,0.4); color: var(--red); }
+    .toast-close { background: none; border: none; cursor: pointer; color: inherit; opacity: 0.7; padding: 0; margin-left: 4px; font-size: 14px; &:hover { opacity: 1; } }
+    @keyframes slideIn { from { opacity: 0; transform: translateY(8px); } to { opacity: 1; transform: translateY(0); } }
+
     @media (max-width: 900px) {
       .summary-strip { gap: 16px; }
       .strip-divider { display: none; }
@@ -489,6 +562,12 @@ export class PortfolioComponent implements OnInit {
   private confirmRecalcTimer: ReturnType<typeof setTimeout> | null = null;
   private recalcMessageTimer: ReturnType<typeof setTimeout> | null = null;
 
+  // Delete portfolio — two-click confirm
+  deletingPortfolio = signal(false);
+  confirmDeletePortfolio = signal(false);
+  deletePortfolioError = signal('');
+  private confirmDeleteTimer: ReturnType<typeof setTimeout> | null = null;
+
   txTypes: { value: TransactionType; label: string }[] = [
     { value: 'BUY', label: 'Buy' },
     { value: 'SELL', label: 'Sell' },
@@ -506,7 +585,12 @@ export class PortfolioComponent implements OnInit {
     commission_usd: 0,
   };
 
-  constructor(private route: ActivatedRoute, private api: ApiService) {}
+  constructor(
+    private route: ActivatedRoute,
+    private api: ApiService,
+    private router: Router,
+    private portfolioStore: PortfolioStoreService,
+  ) {}
 
   ngOnInit(): void {
     this.portfolioId = +this.route.snapshot.paramMap.get('id')!;
@@ -554,6 +638,38 @@ export class PortfolioComponent implements OnInit {
         this.recalcError.set(true);
         this.recalcMessage.set(e.error?.detail || 'Failed to recalculate Holdings.');
         this.recalcMessageTimer = setTimeout(() => this.recalcMessage.set(''), 6000);
+      },
+    });
+  }
+
+  onDeletePortfolioClick(): void {
+    if (this.deletingPortfolio()) return;
+
+    if (this.confirmDeletePortfolio()) {
+      // Second click — confirmed, proceed with deletion
+      if (this.confirmDeleteTimer) clearTimeout(this.confirmDeleteTimer);
+      this.confirmDeletePortfolio.set(false);
+      this.executeDeletePortfolio();
+    } else {
+      // First click — ask for confirmation; deleting wipes every
+      // transaction and position belonging to this portfolio too
+      this.confirmDeletePortfolio.set(true);
+      this.confirmDeleteTimer = setTimeout(() => this.confirmDeletePortfolio.set(false), 4000);
+    }
+  }
+
+  private executeDeletePortfolio(): void {
+    this.deletingPortfolio.set(true);
+    this.deletePortfolioError.set('');
+    this.api.deletePortfolio(this.portfolioId).subscribe({
+      next: () => {
+        this.portfolioStore.remove(this.portfolioId);
+        this.router.navigate(['/']);
+      },
+      error: (e) => {
+        this.deletingPortfolio.set(false);
+        this.deletePortfolioError.set(e.error?.detail || 'Failed to delete portfolio.');
+        setTimeout(() => this.deletePortfolioError.set(''), 5000);
       },
     });
   }

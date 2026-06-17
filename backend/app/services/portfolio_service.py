@@ -58,8 +58,26 @@ class PortfolioService:
 
     @staticmethod
     async def delete(db: AsyncSession, user_id: int, portfolio_id: int) -> None:
+        """
+        Delete a portfolio and everything that belongs to it.
+
+        Transaction.portfolio_id and Position.portfolio_id are plain integer
+        columns (no real foreign key / ON DELETE CASCADE defined on them), so
+        Postgres will not clean those rows up on its own — deleting the
+        Portfolio row alone would leave orphaned transactions and positions
+        behind forever. Delete dependents first, then the portfolio itself.
+        """
         p = await PortfolioService.get_or_404(db, user_id, portfolio_id)
+
+        await db.execute(delete(Transaction).where(Transaction.portfolio_id == portfolio_id))
+        await db.execute(delete(Position).where(Position.portfolio_id == portfolio_id))
         await db.delete(p)
+        await db.flush()
+
+        logger.info(
+            "Portfolio deleted (cascaded transactions + positions)",
+            extra={"user_id": user_id, "portfolio_id": portfolio_id},
+        )
 
     # ── Securities ────────────────────────────────────────────────────────────
 
