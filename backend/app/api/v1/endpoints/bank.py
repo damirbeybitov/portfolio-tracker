@@ -1,4 +1,4 @@
-from fastapi import APIRouter, Depends
+from fastapi import APIRouter, Depends, UploadFile, File
 from sqlalchemy.ext.asyncio import AsyncSession
 from datetime import date
 from typing import Optional
@@ -8,10 +8,11 @@ from app.core.security import get_current_user_id
 from app.schemas.bank import (
     BankAccountCreate, BankAccountUpdate, BankAccountResponse,
     BankInterestRateCreate, BankInterestRateResponse,
-    BankTransactionCreate, BankTransactionResponse,
+    BankTransactionCreate, BankTransactionImportResult, BankTransactionResponse,
     FxRateCreate, FxRateResponse,
 )
 from app.services.bank_service import BankService
+from app.services.import_service import ImportService
 
 router = APIRouter(prefix="/bank", tags=["Bank Accounts"])
 
@@ -130,6 +131,16 @@ async def delete_bank_transaction(
     """
     await BankService.delete_transaction(db, user_id, account_id, transaction_id)
 
+@router.post("/accounts/{account_id}/transactions/import", response_model=BankTransactionImportResult, status_code=201)
+async def import_bank_transactions(
+    account_id: int,
+    file: UploadFile = File(...),
+    user_id: int = Depends(get_current_user_id),
+    db: AsyncSession = Depends(get_db),
+):
+    """Bulk-import bank transactions from CSV/Excel. Required: type, date, amount. Optional: fx_rate, related_account_id, notes."""
+    content = await file.read()
+    return await ImportService.import_bank_transactions(db, user_id, account_id, await file.read(), file.filename)
 
 # ── FX Rates ──────────────────────────────────────────────────────────────────
 

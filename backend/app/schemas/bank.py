@@ -80,3 +80,16 @@ class FxRateResponse(BaseModel):
     usd_to_kzt: Decimal
     source: str
     model_config = {"from_attributes": True}
+
+class BankTransactionImportRow(BaseModel):
+    row: int
+    status: str
+    error: Optional[str] = None
+    transaction: Optional[BankTransactionResponse] = None
+
+
+class BankTransactionImportResult(BaseModel):
+    total: int
+    imported: int
+    failed: int
+    results: list[BankTransactionImportRow]

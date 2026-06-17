@@ -1,4 +1,4 @@
-from fastapi import APIRouter, Depends, Query
+from fastapi import APIRouter, Depends, File, Query, UploadFile
 from sqlalchemy.ext.asyncio import AsyncSession
 from typing import Optional
 
@@ -6,10 +6,11 @@ from app.db.session import get_db
 from app.core.security import get_current_user_id
 from app.schemas.portfolio import (
     PortfolioCreate, PortfolioUpdate, PortfolioResponse,
-    TransactionCreate, TransactionResponse,
+    TransactionCreate, TransactionImportResult, TransactionResponse,
     SecurityResponse, PortfolioSummary,
 )
 from app.services.portfolio_service import PortfolioService
+from app.services.import_service import ImportService
 
 router = APIRouter(prefix="/portfolios", tags=["Portfolios"])
 
@@ -99,6 +100,24 @@ async def delete_transaction(
     """
     await PortfolioService.delete_transaction(db, user_id, portfolio_id, transaction_id)
 
+@router.post("/{portfolio_id}/transactions/import", response_model=TransactionImportResult, status_code=201)
+async def import_transactions(
+    portfolio_id: int,
+    file: UploadFile = File(...),
+    user_id: int = Depends(get_current_user_id),
+    db: AsyncSession = Depends(get_db),
+):
+    """
+    Bulk-import transactions from CSV or Excel (.xlsx).
+
+    Required columns: ticker, type, date, quantity, price_usd
+    Optional columns: fx_rate_usd_kzt, commission_usd, split_ratio, notes
+
+    type ∈ BUY, SELL, DIVIDEND, TAX, SPLIT, COMMISSION
+    date formats: YYYY-MM-DD, DD.MM.YYYY, DD/MM/YYYY, MM/DD/YYYY
+    """
+    content = await file.read()
+    return await ImportService.import_transactions(db, user_id, portfolio_id, content, file.filename)
 
 # ── Securities ────────────────────────────────────────────────────────────────
 

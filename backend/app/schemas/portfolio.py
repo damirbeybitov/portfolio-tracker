@@ -105,6 +105,18 @@ class TransactionResponse(BaseModel):
     created_at: datetime
     model_config = {"from_attributes": True}
 
+class TransactionImportRow(BaseModel):
+    row: int
+    status: str  # "ok" | "error"
+    error: Optional[str] = None
+    transaction: Optional[TransactionResponse] = None
+
+
+class TransactionImportResult(BaseModel):
+    total: int
+    imported: int
+    failed: int
+    results: list[TransactionImportRow]
 
 # ─── Portfolio Summary ─────────────────────────────────────────────────────────
 

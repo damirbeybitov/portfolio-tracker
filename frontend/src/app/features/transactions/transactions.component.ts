@@ -1,4 +1,4 @@
-import { Component, OnInit, signal } from '@angular/core';
+import { Component, OnInit, signal, ViewChild, ElementRef } from '@angular/core';
 import { CommonModule } from '@angular/common';
 import { RouterLink, ActivatedRoute } from '@angular/router';
 import { FormsModule } from '@angular/forms';
@@ -9,6 +9,20 @@ const TX_BADGES: Record<TransactionType, string> = {
   BUY: 'badge-green', SELL: 'badge-red', DIVIDEND: 'badge-blue',
   TAX: 'badge-amber', SPLIT: 'badge-muted', COMMISSION: 'badge-muted'
 };
+
+interface ImportRowResult {
+  row: number;
+  status: 'ok' | 'error';
+  error?: string;
+  transaction?: Transaction;
+}
+
+interface ImportResult {
+  total: number;
+  imported: number;
+  failed: number;
+  results: ImportRowResult[];
+}
 
 @Component({
   selector: 'app-transactions',
@@ -22,7 +36,69 @@ const TX_BADGES: Record<TransactionType, string> = {
           <h1 class="page-title">Transaction History</h1>
           <p class="page-subtitle">{{ filtered().length }} of {{ transactions().length }} transactions</p>
         </div>
+        <div class="flex gap-2">
+          <input type="file" #fileInput hidden accept=".csv,.xlsx,.xls" (change)="onFileSelected($event)">
+          <button class="btn btn-secondary" (click)="openImportPicker()" [disabled]="importing()">
+            @if (importing()) {
+              <span class="spinner" style="width:13px;height:13px;border-width:2px"></span>
+            } @else {
+              <svg width="13" height="13" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24">
+                <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/>
+                <polyline points="17 8 12 3 7 8"/><line x1="12" y1="3" x2="12" y2="15"/>
+              </svg>
+            }
+            Import CSV/Excel
+          </button>
+        </div>
       </div>
+
+      <!-- Import template hint -->
+      <div class="import-hint card" style="margin-bottom:20px; padding:14px 20px;">
+        <div class="hint-row">
+          <svg width="15" height="15" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24" style="flex-shrink:0; margin-top:2px; color:var(--text-muted)">
+            <circle cx="12" cy="12" r="10"/><line x1="12" y1="16" x2="12" y2="12"/><line x1="12" y1="8" x2="12.01" y2="8"/>
+          </svg>
+          <div>
+            <strong>Columns required:</strong> ticker, type, date, quantity, price_usd.
+            <strong>Optional:</strong> fx_rate_usd_kzt, commission_usd, split_ratio, notes.
+            <span class="text-muted">type ∈ BUY / SELL / DIVIDEND / TAX / SPLIT / COMMISSION. Date: YYYY-MM-DD, DD.MM.YYYY, DD/MM/YYYY, or MM/DD/YYYY.</span>
+          </div>
+        </div>
+      </div>
+
+      <!-- Import result banner -->
+      @if (importResult()) {
+        <div class="card import-result" [class.has-errors]="importResult()!.failed > 0" style="margin-bottom:20px;">
+          <div class="import-result-header">
+            <div class="ir-summary">
+              <span class="ir-badge" [class.ok]="importResult()!.failed === 0" [class.warn]="importResult()!.failed > 0">
+                @if (importResult()!.failed === 0) {
+                  <svg width="14" height="14" fill="none" stroke="currentColor" stroke-width="2.5" viewBox="0 0 24 24"><polyline points="20 6 9 17 4 12"/></svg>
+                } @else {
+                  <svg width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><circle cx="12" cy="12" r="10"/><line x1="12" y1="8" x2="12" y2="12"/><line x1="12" y1="16" x2="12.01" y2="16"/></svg>
+                }
+              </span>
+              <span>
+                Imported <strong>{{ importResult()!.imported }}</strong> of <strong>{{ importResult()!.total }}</strong> rows
+                @if (importResult()!.failed > 0) {
+                  — <strong class="text-red">{{ importResult()!.failed }} failed</strong>
+                }
+              </span>
+            </div>
+            <button class="btn btn-ghost btn-sm" (click)="importResult.set(null)">✕</button>
+          </div>
+          @if (importResult()!.failed > 0) {
+            <div class="ir-errors">
+              @for (r of failedRows(); track r.row) {
+                <div class="ir-error-row">
+                  <span class="ir-row-num">Row {{ r.row }}</span>
+                  <span class="ir-error-text">{{ r.error }}</span>
+                </div>
+              }
+            </div>
+          }
+        </div>
+      }
 
       <!-- Filters -->
       <div class="filters card" style="margin-bottom:20px; padding:16px 20px;">
@@ -174,6 +250,29 @@ const TX_BADGES: Record<TransactionType, string> = {
     .tot-value { font-size: 14px; font-weight: 600; }
     .tot-sep { color: var(--border-active); }
 
+    /* Import hint */
+    .import-hint { font-size: 12px; color: var(--text-secondary); }
+    .hint-row { display: flex; gap: 10px; align-items: flex-start; line-height: 1.6; }
+
+    /* Import result banner */
+    .import-result { padding: 0; overflow: hidden; }
+    .import-result-header {
+      display: flex; align-items: center; justify-content: space-between;
+      padding: 14px 20px; font-size: 13px;
+    }
+    .import-result.has-errors .import-result-header { border-bottom: 1px solid var(--border); }
+    .ir-summary { display: flex; align-items: center; gap: 10px; }
+    .ir-badge {
+      display: flex; align-items: center; justify-content: center;
+      width: 22px; height: 22px; border-radius: 50%; flex-shrink: 0;
+      &.ok { background: var(--green-dim); color: var(--green); }
+      &.warn { background: var(--amber-dim); color: var(--amber); }
+    }
+    .ir-errors { padding: 4px 20px 16px; display: flex; flex-direction: column; gap: 6px; max-height: 220px; overflow-y: auto; }
+    .ir-error-row { display: flex; gap: 10px; font-size: 12px; }
+    .ir-row-num { color: var(--text-muted); font-family: var(--font-mono); flex-shrink: 0; min-width: 56px; }
+    .ir-error-text { color: var(--red); }
+
     /* Row deleting state */
     tr.deleting td { opacity: 0.4; transition: opacity 0.2s; }
 
@@ -217,6 +316,8 @@ const TX_BADGES: Record<TransactionType, string> = {
   `]
 })
 export class TransactionsComponent implements OnInit {
+  @ViewChild('fileInput') fileInput!: ElementRef<HTMLInputElement>;
+
   portfolioId!: number;
   loading = signal(true);
   transactions = signal<Transaction[]>([]);
@@ -231,10 +332,20 @@ export class TransactionsComponent implements OnInit {
   deleteError = signal('');
   private confirmTimer: ReturnType<typeof setTimeout> | null = null;
 
+  // Import state
+  importing = signal(false);
+  importResult = signal<ImportResult | null>(null);
+  failedRows = () => (this.importResult()?.results || []).filter(r => r.status === 'error');
+
   constructor(private route: ActivatedRoute, private api: ApiService) {}
 
   ngOnInit(): void {
     this.portfolioId = +this.route.snapshot.paramMap.get('id')!;
+    this.loadTransactions();
+  }
+
+  loadTransactions(): void {
+    this.loading.set(true);
     this.api.listTransactions(this.portfolioId).subscribe({
       next: (txs) => {
         this.transactions.set(txs);
@@ -306,6 +417,41 @@ export class TransactionsComponent implements OnInit {
         this.deletingId.set(null);
         // Auto-dismiss error after 5s
         setTimeout(() => this.deleteError.set(''), 5000);
+      }
+    });
+  }
+
+  // ── Import ────────────────────────────────────────────────────────────
+
+  openImportPicker(): void {
+    if (this.importing()) return;
+    this.fileInput.nativeElement.value = '';
+    this.fileInput.nativeElement.click();
+  }
+
+  onFileSelected(event: Event): void {
+    const input = event.target as HTMLInputElement;
+    const file = input.files?.[0];
+    if (!file) return;
+
+    this.importing.set(true);
+    this.importResult.set(null);
+    this.deleteError.set('');
+
+    this.api.importTransactions(this.portfolioId, file).subscribe({
+      next: (res: ImportResult) => {
+        this.importResult.set(res);
+        this.importing.set(false);
+        this.loadTransactions();
+      },
+      error: (e) => {
+        this.importing.set(false);
+        this.importResult.set({
+          total: 0,
+          imported: 0,
+          failed: 1,
+          results: [{ row: 0, status: 'error', error: e.error?.detail || 'Import failed. Check file format.' }]
+        });
       }
     });
   }

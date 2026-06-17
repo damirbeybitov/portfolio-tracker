@@ -54,6 +54,11 @@ export class ApiService {
   addTransaction(portfolioId: number, data: TransactionCreate): Observable<Transaction> {
     return this.http.post<Transaction>(`${API}/portfolios/${portfolioId}/transactions`, data);
   }
+  importTransactions(portfolioId: number, file: File): Observable<any> {
+    const formData = new FormData();
+    formData.append('file', file);
+    return this.http.post(`${API}/portfolios/${portfolioId}/transactions/import`, formData);
+  }
   deleteTransaction(portfolioId: number, transactionId: number): Observable<void> {
     return this.http.delete<void>(`${API}/portfolios/${portfolioId}/transactions/${transactionId}`);
   }
@@ -101,6 +106,11 @@ export class ApiService {
   }
   addBankTransaction(accountId: number, data: BankTransactionCreate): Observable<BankTransaction> {
     return this.http.post<BankTransaction>(`${API}/bank/accounts/${accountId}/transactions`, data);
+  }
+  importBankTransactions(accountId: number, file: File): Observable<any> {
+    const formData = new FormData();
+    formData.append('file', file);
+    return this.http.post(`${API}/bank/accounts/${accountId}/transactions/import`, formData);
   }
   deleteBankTransaction(accountId: number, transactionId: number): Observable<void> {
     return this.http.delete<void>(`${API}/bank/accounts/${accountId}/transactions/${transactionId}`);
