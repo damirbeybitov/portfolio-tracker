@@ -1,3 +1,5 @@
+import logging
+
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select, and_, delete
 from sqlalchemy.orm import load_only
@@ -14,6 +16,8 @@ from app.schemas.portfolio import (
 )
 from app.services.price_service import PriceService
 from app.services.fx_service import FxService
+
+logger = logging.getLogger("app.services.portfolio")
 
 
 class PortfolioService:
@@ -329,6 +333,65 @@ class PortfolioService:
             )
             responses.append(r)
         return responses
+
+    # ── Recalculate positions from transaction history ──────────────────────
+
+    @staticmethod
+    async def recalculate_positions(db: AsyncSession, user_id: int, portfolio_id: int) -> PortfolioSummary:
+        """
+        Rebuild every position for this portfolio from scratch by replaying
+        the full transaction history in chronological order.
+
+        Positions are a denormalized cache derived from transactions. If that
+        cache drifts from reality — bulk import, manual data fix, an old bug —
+        this throws the cache away and rebuilds it from the transaction log,
+        which is the source of truth.
+        """
+        await PortfolioService.get_or_404(db, user_id, portfolio_id)
+
+        # Drop existing positions; they're about to be rebuilt from scratch.
+        await db.execute(delete(Position).where(Position.portfolio_id == portfolio_id))
+        await db.flush()
+
+        # Replay transactions oldest-first. created_at breaks ties for same-day
+        # transactions so replay order matches original entry order.
+        result = await db.execute(
+            select(Transaction)
+            .where(Transaction.portfolio_id == portfolio_id)
+            .order_by(Transaction.date.asc(), Transaction.created_at.asc())
+        )
+        txs = result.scalars().all()
+
+        security_ids = list({tx.security_id for tx in txs})
+        securities: dict[int, Security] = {}
+        if security_ids:
+            sec_result = await db.execute(select(Security).where(Security.id.in_(security_ids)))
+            securities = {s.id: s for s in sec_result.scalars().all()}
+
+        skipped_tx_ids: list[int] = []
+        for tx in txs:
+            security = securities.get(tx.security_id)
+            if not security:
+                skipped_tx_ids.append(tx.id)
+                continue
+            try:
+                await PortfolioService._update_position(db, portfolio_id, security, tx, tx.fx_rate_usd_kzt)
+            except HTTPException:
+                # A SELL with insufficient prior quantity (bad import order,
+                # or data inconsistency). Don't abort the whole recalculation
+                # over one bad row — skip it and log it for follow-up.
+                skipped_tx_ids.append(tx.id)
+                continue
+
+        await db.flush()
+
+        if skipped_tx_ids:
+            logger.warning(
+                "Recalculate positions: skipped inconsistent transactions",
+                extra={"portfolio_id": portfolio_id, "skipped_tx_ids": skipped_tx_ids},
+            )
+
+        return await PortfolioService.get_summary(db, user_id, portfolio_id)
 
     # ── Portfolio Summary ─────────────────────────────────────────────────────
 

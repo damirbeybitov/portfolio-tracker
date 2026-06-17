@@ -46,6 +46,9 @@ export class ApiService {
   getPortfolioSummary(id: number): Observable<PortfolioSummary> {
     return this.http.get<PortfolioSummary>(`${API}/portfolios/${id}/summary`);
   }
+  recalculatePortfolio(id: number): Observable<PortfolioSummary> {
+    return this.http.post<PortfolioSummary>(`${API}/portfolios/${id}/recalculate`, {});
+  }
 
   // Transactions
   listTransactions(portfolioId: number): Observable<Transaction[]> {

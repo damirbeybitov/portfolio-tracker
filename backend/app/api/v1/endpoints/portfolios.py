@@ -44,6 +44,24 @@ async def get_portfolio_summary(
     return await PortfolioService.get_summary(db, user_id, portfolio_id)
 
 
+@router.post("/{portfolio_id}/recalculate", response_model=PortfolioSummary)
+async def recalculate_portfolio(
+    portfolio_id: int,
+    user_id: int = Depends(get_current_user_id),
+    db: AsyncSession = Depends(get_db),
+):
+    """
+    Rebuild Holdings (positions) from the transaction history.
+
+    Wipes the cached positions for this portfolio and replays every
+    BUY/SELL/SPLIT transaction in date order to recompute quantity, average
+    cost, and total invested from scratch. Use this if Holdings looks wrong
+    after a bulk import or any other data inconsistency — the transaction
+    history is always treated as the source of truth.
+    """
+    return await PortfolioService.recalculate_positions(db, user_id, portfolio_id)
+
+
 @router.patch("/{portfolio_id}", response_model=PortfolioResponse)
 async def update_portfolio(
     portfolio_id: int,

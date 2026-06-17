@@ -94,7 +94,30 @@ import { PortfolioSummary, Position, Security, TransactionCreate, TransactionTyp
         <div class="card">
           <div class="card-header">
             <h2>Holdings</h2>
-            <div class="flex gap-2">
+            <div class="flex gap-2 items-center">
+              @if (recalcMessage()) {
+                <span class="recalc-msg" [class.recalc-error]="recalcError()">{{ recalcMessage() }}</span>
+              }
+              <button
+                class="btn btn-ghost btn-sm"
+                [class.recalc-confirming]="confirmRecalc()"
+                [disabled]="recalcLoading()"
+                (click)="onRecalculateClick()"
+                title="Rebuild Holdings from the full transaction history. Use this if positions look wrong after an import or data edit."
+              >
+                @if (recalcLoading()) {
+                  <span class="spinner" style="width:13px;height:13px;border-width:2px"></span>
+                  Recalculating...
+                } @else if (confirmRecalc()) {
+                  <svg width="13" height="13" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><polyline points="20 6 9 17 4 12"/></svg>
+                  Confirm rebuild
+                } @else {
+                  <svg width="13" height="13" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24">
+                    <polyline points="23 4 23 10 17 10"/><path d="M20.49 15a9 9 0 1 1-2.12-9.36L23 10"/>
+                  </svg>
+                  Recalculate Holdings
+                }
+              </button>
               <button class="btn btn-ghost btn-sm" (click)="openAddTx('SPLIT')">Split</button>
               <button class="btn btn-ghost btn-sm" (click)="openAddTx('DIVIDEND')">Dividend</button>
               <button class="btn btn-ghost btn-sm" (click)="openAddTx('TAX')">Tax</button>
@@ -358,7 +381,25 @@ import { PortfolioSummary, Position, Security, TransactionCreate, TransactionTyp
     .strip-actions { margin-left: auto; }
 
     /* Card header */
-    .card-header { display: flex; align-items: center; justify-content: space-between; padding: 18px 20px; border-bottom: 1px solid var(--border); h2 { font-family: var(--font-display); font-size: 15px; } }
+    .card-header { display: flex; align-items: center; justify-content: space-between; padding: 18px 20px; border-bottom: 1px solid var(--border); h2 { font-family: var(--font-display); font-size: 15px; } flex-wrap: wrap; gap: 10px; }
+
+    /* Recalculate button + message */
+    .recalc-msg {
+      font-size: 12px;
+      color: var(--green);
+      white-space: nowrap;
+      &.recalc-error { color: var(--red); }
+    }
+    .recalc-confirming {
+      background: var(--amber-dim) !important;
+      color: var(--amber) !important;
+      border-color: rgba(251,191,36,0.4) !important;
+      animation: pulse-border-amber 1s ease-in-out infinite;
+    }
+    @keyframes pulse-border-amber {
+      0%, 100% { border-color: rgba(251,191,36,0.4); }
+      50% { border-color: rgba(251,191,36,0.8); }
+    }
 
     /* Table */
     .num-col { text-align: right; }
@@ -440,6 +481,14 @@ export class PortfolioComponent implements OnInit {
   searchLoading = false;
   private searchTimeout: ReturnType<typeof setTimeout> | null = null;
 
+  // Recalculate Holdings
+  recalcLoading = signal(false);
+  confirmRecalc = signal(false);
+  recalcMessage = signal('');
+  recalcError = signal(false);
+  private confirmRecalcTimer: ReturnType<typeof setTimeout> | null = null;
+  private recalcMessageTimer: ReturnType<typeof setTimeout> | null = null;
+
   txTypes: { value: TransactionType; label: string }[] = [
     { value: 'BUY', label: 'Buy' },
     { value: 'SELL', label: 'Sell' },
@@ -469,6 +518,43 @@ export class PortfolioComponent implements OnInit {
     this.api.getPortfolioSummary(this.portfolioId).subscribe({
       next: (s) => { this.summary.set(s); this.loading.set(false); },
       error: () => this.loading.set(false),
+    });
+  }
+
+  onRecalculateClick(): void {
+    if (this.recalcLoading()) return;
+
+    if (this.confirmRecalc()) {
+      // Second click — confirmed, proceed
+      if (this.confirmRecalcTimer) clearTimeout(this.confirmRecalcTimer);
+      this.confirmRecalc.set(false);
+      this.executeRecalculate();
+    } else {
+      // First click — ask for confirmation since this rewrites Holdings
+      this.confirmRecalc.set(true);
+      this.confirmRecalcTimer = setTimeout(() => this.confirmRecalc.set(false), 4000);
+    }
+  }
+
+  private executeRecalculate(): void {
+    this.recalcLoading.set(true);
+    this.recalcMessage.set('');
+    if (this.recalcMessageTimer) clearTimeout(this.recalcMessageTimer);
+
+    this.api.recalculatePortfolio(this.portfolioId).subscribe({
+      next: (s) => {
+        this.summary.set(s);
+        this.recalcLoading.set(false);
+        this.recalcError.set(false);
+        this.recalcMessage.set(`Holdings rebuilt — ${s.positions.length} position${s.positions.length !== 1 ? 's' : ''} from history.`);
+        this.recalcMessageTimer = setTimeout(() => this.recalcMessage.set(''), 6000);
+      },
+      error: (e) => {
+        this.recalcLoading.set(false);
+        this.recalcError.set(true);
+        this.recalcMessage.set(e.error?.detail || 'Failed to recalculate Holdings.');
+        this.recalcMessageTimer = setTimeout(() => this.recalcMessage.set(''), 6000);
+      },
     });
   }
 
