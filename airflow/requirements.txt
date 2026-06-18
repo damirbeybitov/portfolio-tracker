@@ -1,0 +1,10 @@
+# NOTE: versions for packages Airflow's own constraints file already pins
+# (psycopg2-binary, httpx) are intentionally left unpinned here — the
+# --constraint flag in the Dockerfile RUN command resolves those to the
+# exact versions Airflow 2.9.3 was tested against. Pinning a different
+# version here would make pip fail to resolve (it can't satisfy both an
+# explicit pin and a conflicting constraint).
+psycopg2-binary
+httpx
+yfinance==0.2.44
+pandas

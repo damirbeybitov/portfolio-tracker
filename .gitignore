@@ -36,3 +36,9 @@ Thumbs.db
 # Logs
 *.log
 logs/
+
+# Airflow
+airflow/logs/*
+!airflow/logs/.gitkeep
+airflow/plugins/__pycache__/
+airflow/dags/__pycache__/
