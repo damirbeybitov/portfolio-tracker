@@ -617,6 +617,10 @@ export class BankComponent implements OnInit {
 
   addTransaction(): void {
     if (!this.txTargetAccount) return;
+    if ((this.newTx.type === 'TRANSFER_IN' || this.newTx.type === 'TRANSFER_OUT') && !this.newTx.related_account_id) {
+      this.txError = 'Select the other account for this transfer.';
+      return;
+    }
     this.txModalLoading = true; this.txError = '';
     const payload: BankTransactionCreate = {
       type: this.newTx.type!,
@@ -626,12 +630,27 @@ export class BankComponent implements OnInit {
       related_account_id: this.newTx.related_account_id || undefined,
       notes: this.newTx.notes || undefined,
     };
-    this.api.addBankTransaction(this.txTargetAccount.id, payload).subscribe({
+    // The backend now auto-creates the mirrored leg on the related account
+    // for TRANSFER_IN/TRANSFER_OUT, so both accounts' balances changed —
+    // not just the one we posted to — and we need to know the related
+    // account's id up front so we can refresh its transaction list too if
+    // it happens to be the one currently selected on screen.
+    const isTransfer = (payload.type === 'TRANSFER_IN' || payload.type === 'TRANSFER_OUT') && !!payload.related_account_id;
+    const relatedAccountId = payload.related_account_id;
+    const postedToAccountId = this.txTargetAccount.id;
+
+    this.api.addBankTransaction(postedToAccountId, payload).subscribe({
       next: () => {
         this.showTxModal = false; this.txModalLoading = false;
+        // Always refresh the account list — both legs' balances may have changed.
         this.api.listBankAccounts().subscribe(accs => this.accounts.set(accs));
-        if (this.selectedAccountId() === this.txTargetAccount!.id) {
-          this.api.listBankTransactions(this.txTargetAccount!.id).subscribe(txs => this.selectedTxs.set(txs));
+
+        const selectedId = this.selectedAccountId();
+        const selectedIsInvolved =
+          selectedId === postedToAccountId || (isTransfer && selectedId === relatedAccountId);
+
+        if (selectedIsInvolved) {
+          this.api.listBankTransactions(selectedId!).subscribe(txs => this.selectedTxs.set(txs));
         }
       },
       error: (e) => { this.txError = e.error?.detail || 'Failed'; this.txModalLoading = false; }
