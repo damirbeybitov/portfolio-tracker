@@ -1,4 +1,5 @@
 import logging
+import uuid
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select, and_, desc, func
 from fastapi import HTTPException, status
@@ -148,6 +149,16 @@ class BankService:
         same DB transaction, so a single "Transfer" action in the UI produces
         a balanced pair of entries instead of requiring the user to create
         each side manually. Both legs commit together or not at all.
+
+        Cross-currency transfers: `amount` is always denominated in the
+        account you're posting to (account_id), i.e. the source account for
+        a TRANSFER_OUT. If the related account uses a different currency,
+        the mirrored leg's amount is converted using the USD/KZT rate
+        (either the one supplied on the request, or — if omitted — the
+        current rate from FxService) before being applied to that account's
+        balance. Without this conversion, a $100 transfer from a USD account
+        to a KZT account would otherwise credit the KZT account exactly
+        100 KZT instead of ~100 * fx_rate KZT — silently destroying value.
         """
         account = await BankService.get_account_or_404(db, user_id, account_id)
 
@@ -158,21 +169,56 @@ class BankService:
 
             related_account = await BankService.get_account_or_404(db, user_id, data.related_account_id)
 
-        tx = await BankService._apply_transaction(db, account, data)
+        # Both legs of an auto-mirrored transfer share one transfer_group_id,
+        # generated up front so it can be passed into _apply_transaction
+        # consistently for both legs (rather than setting it via attribute
+        # assignment after the fact on just one side, which would be easy
+        # to get out of sync with future changes to this method).
+        is_mirrored_transfer = bool(
+            related_account and data.type in TRANSFER_MIRROR
+        )
+        is_cross_currency = bool(
+            related_account and str(account.currency) != str(related_account.currency)
+        )
+
+        if is_mirrored_transfer and is_cross_currency and not data.fx_rate:
+            # Don't silently fall back to an auto-fetched rate here. The
+            # user controls the FX rate explicitly (see fx_service.py /
+            # the "Set FX Rate" UI) and a cross-currency transfer is exactly
+            # the moment that rate has real, immediate financial effect —
+            # require it on the request rather than letting a stale or
+            # live-fetched number get baked into the converted leg without
+            # the user seeing or choosing it.
+            raise HTTPException(
+                status_code=422,
+                detail=(
+                    f"This transfer moves money between a {account.currency} account and a "
+                    f"{related_account.currency} account. Provide fx_rate (USD->KZT, e.g. 475.50) "
+                    f"so the converted amount is explicit."
+                ),
+            )
+
+        group_id = uuid.uuid4() if is_mirrored_transfer else None
+
+        tx = await BankService._apply_transaction(db, account, data, transfer_group_id=group_id)
 
         # Auto-create the mirrored leg for transfers between two of the
         # user's own accounts. We don't mirror INCOME/EXPENSE/etc. — only
         # TRANSFER_IN/TRANSFER_OUT, since those are explicitly two-sided.
-        if related_account and data.type in TRANSFER_MIRROR:
+        if is_mirrored_transfer:
+            mirrored_amount = await BankService._convert_amount(
+                db, amount=data.amount, from_currency=str(account.currency.value),
+                to_currency=str(related_account.currency.value), fx_rate=data.fx_rate,
+            )
             mirrored_data = BankTransactionCreate(
                 type=TRANSFER_MIRROR[data.type],
                 date=data.date,
-                amount=-data.amount,
+                amount=-mirrored_amount,
                 related_account_id=account_id,
                 fx_rate=data.fx_rate,
                 notes=data.notes,
             )
-            await BankService._apply_transaction(db, related_account, mirrored_data)
+            await BankService._apply_transaction(db, related_account, mirrored_data, transfer_group_id=group_id)
 
         await db.flush()
         await db.refresh(tx)
@@ -185,16 +231,54 @@ class BankService:
                 "type": data.type,
                 "amount": float(data.amount),
                 "currency": account.currency,
-                "mirrored": bool(related_account and data.type in TRANSFER_MIRROR),
+                "mirrored": is_mirrored_transfer,
+                "cross_currency": is_cross_currency,
+                "fx_rate_used": float(data.fx_rate) if data.fx_rate else None,
             },
         )
         return BankTransactionResponse.model_validate(tx)
+
+    @staticmethod
+    async def _convert_amount(
+        db: AsyncSession,
+        amount: Decimal,
+        from_currency: str,
+        to_currency: str,
+        fx_rate: Optional[Decimal],
+    ) -> Decimal:
+        """
+        Convert a (positive-magnitude) amount from one account currency to
+        another. Same currency -> no-op. Different currency -> use the
+        supplied fx_rate if present, otherwise fetch the current USD/KZT
+        rate. fx_rate is always expressed as USD->KZT regardless of
+        direction, matching the convention used everywhere else in this
+        codebase (Transaction.fx_rate_usd_kzt, FxRate.usd_to_kzt).
+        """
+        if from_currency == to_currency:
+            return amount
+
+        rate = fx_rate if fx_rate else await FxService.get_rate(db)
+
+        if from_currency == "USD" and to_currency == "KZT":
+            return amount * rate
+        if from_currency == "KZT" and to_currency == "USD":
+            return amount / rate
+
+        # Only USD/KZT accounts exist today (AccountCurrency enum), so this
+        # branch should be unreachable — but fail loudly instead of silently
+        # mis-converting if that ever changes.
+        raise HTTPException(
+            status_code=422,
+            detail=f"Unsupported currency pair for transfer: {from_currency} -> {to_currency}",
+        )
+
 
     @staticmethod
     async def _apply_transaction(
         db: AsyncSession,
         account: BankAccount,
         data: BankTransactionCreate,
+        transfer_group_id: Optional[uuid.UUID] = None,
     ) -> BankTransaction:
         """
         Core balance-update + row-insert logic, shared by both legs of a
@@ -225,6 +309,7 @@ class BankService:
             related_account_id=data.related_account_id,
             fx_rate=data.fx_rate,
             notes=data.notes,
+            transfer_group_id=transfer_group_id,
         )
         db.add(tx)
         await db.flush()
@@ -254,10 +339,29 @@ class BankService:
         if not tx:
             raise HTTPException(status_code=404, detail="Transaction not found")
 
-        # Find the mirrored leg, if any: same type-pair, same date/amount
-        # magnitude, pointing back at this account, on the related account.
+        # Find the mirrored leg, if any. Primary match is transfer_group_id
+        # — exact and unambiguous, including for cross-currency transfers
+        # where the two legs' amounts differ (one side is converted via
+        # fx_rate, so amount can't be used for matching).
+        #
+        # Fallback: rows created before this column existed (or any
+        # legacy/manually-entered transfer pairs) have transfer_group_id =
+        # NULL, so for those we fall back to the old heuristic — same
+        # type-pair, same date, pointing back at this account — on a
+        # best-effort basis. New transfers created by add_transaction
+        # always get a group id and never hit this branch.
         mirror_tx: Optional[BankTransaction] = None
-        if tx.related_account_id and tx.type in TRANSFER_MIRROR:
+        if tx.transfer_group_id is not None:
+            mirror_result = await db.execute(
+                select(BankTransaction).where(
+                    and_(
+                        BankTransaction.transfer_group_id == tx.transfer_group_id,
+                        BankTransaction.id != tx.id,
+                    )
+                ).limit(1)
+            )
+            mirror_tx = mirror_result.scalar_one_or_none()
+        elif tx.related_account_id and tx.type in TRANSFER_MIRROR:
             mirror_result = await db.execute(
                 select(BankTransaction).where(
                     and_(
@@ -265,7 +369,7 @@ class BankService:
                         BankTransaction.related_account_id == account_id,
                         BankTransaction.type == TRANSFER_MIRROR[tx.type],
                         BankTransaction.date == tx.date,
-                        BankTransaction.amount == -tx.amount,
+                        BankTransaction.transfer_group_id.is_(None),
                     )
                 ).order_by(desc(BankTransaction.created_at)).limit(1)
             )

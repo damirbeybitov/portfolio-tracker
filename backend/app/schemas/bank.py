@@ -2,6 +2,7 @@ from pydantic import BaseModel, Field
 from datetime import datetime, date
 from decimal import Decimal
 from typing import Optional
+from uuid import UUID
 from app.models.bank import AccountCurrency, BankTransactionType
 
 
@@ -53,6 +54,11 @@ class BankTransactionCreate(BaseModel):
     related_account_id: Optional[int] = None
     fx_rate: Optional[Decimal] = None
     notes: Optional[str] = None
+    # transfer_group_id is intentionally NOT here — it's generated
+    # server-side in BankService.add_transaction and shared between the
+    # two auto-created legs of a transfer. Accepting it from the client
+    # would let a caller forge/collide group ids and corrupt the pairing
+    # used by delete_transaction.
 
 
 class BankTransactionResponse(BaseModel):
@@ -65,6 +71,7 @@ class BankTransactionResponse(BaseModel):
     related_account_id: Optional[int]
     fx_rate: Optional[Decimal]
     notes: Optional[str]
+    transfer_group_id: Optional[UUID] = None
     created_at: datetime
     model_config = {"from_attributes": True}
 

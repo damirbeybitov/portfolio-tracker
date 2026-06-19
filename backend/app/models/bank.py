@@ -1,9 +1,11 @@
 from sqlalchemy import String, Text, Integer, DateTime, Numeric, Date, Boolean, Enum as SAEnum
+from sqlalchemy.dialects.postgresql import UUID as PG_UUID
 from sqlalchemy.orm import Mapped, mapped_column
 from sqlalchemy.sql import func
 from datetime import datetime, date
 from decimal import Decimal
 import enum
+import uuid
 
 from app.db.base import Base
 
@@ -66,6 +68,17 @@ class BankTransaction(Base):
     related_account_id: Mapped[int | None] = mapped_column(Integer)
     fx_rate: Mapped[Decimal | None] = mapped_column(Numeric(12, 4))
     notes: Mapped[str | None] = mapped_column(Text)
+    # Links the two legs of an auto-created transfer (TRANSFER_OUT on the
+    # source account + TRANSFER_IN on the destination account) so they can
+    # be reliably found and deleted together, including for cross-currency
+    # transfers where amount differs between the two legs and can't be used
+    # for matching. NULL for every other transaction type (INCOME, EXPENSE,
+    # INTEREST, STOCK_BUY, etc.) — those are single-sided and have nothing
+    # to link to. Both legs of a pair share the same UUID, generated once
+    # at creation time in BankService.add_transaction.
+    transfer_group_id: Mapped[uuid.UUID | None] = mapped_column(
+        PG_UUID(as_uuid=True), nullable=True, index=True
+    )
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
 
 

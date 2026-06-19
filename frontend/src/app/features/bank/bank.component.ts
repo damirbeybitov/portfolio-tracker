@@ -282,12 +282,7 @@ const TX_BADGES: Record<string, string> = {
               <label>Amount <span class="text-muted">(positive = money in, negative = money out)</span></label>
               <input type="number" class="form-control" [(ngModel)]="newTx.amount" step="0.01">
             </div>
-            @if (newTx.type === 'EXCHANGE') {
-              <div class="form-group">
-                <label>FX Rate (USD/KZT)</label>
-                <input type="number" class="form-control" [(ngModel)]="newTx.fx_rate" step="0.01" placeholder="e.g. 455.50">
-              </div>
-            }
+
             @if (newTx.type === 'TRANSFER_IN' || newTx.type === 'TRANSFER_OUT') {
               <div class="form-group">
                 <label>Related Account</label>
@@ -301,6 +296,40 @@ const TX_BADGES: Record<string, string> = {
                 </select>
               </div>
             }
+
+            @if (isCrossCurrencyTransfer()) {
+              <div class="form-group">
+                <label>
+                  FX Rate (USD/KZT) <span class="required-mark">*</span>
+                </label>
+                <input type="number" class="form-control" [(ngModel)]="newTx.fx_rate"
+                  step="0.01" placeholder="e.g. 455.50" [class.invalid]="!newTx.fx_rate">
+                <div class="fx-rate-hint">
+                  <span>Live rate: {{ fxRate() | number:'1.2-2' }} KZT/USD</span>
+                  <button type="button" class="btn-use-live" (click)="useLiveFxRate()">Use this</button>
+                </div>
+                @if (!newTx.fx_rate) {
+                  <div class="fx-rate-warning">
+                    Required — this transfer moves money between a {{ txTargetAccount?.currency }}
+                    account and a {{ relatedAccountCurrency() }} account. The rate you set here is
+                    exactly what gets applied on the other side.
+                  </div>
+                }
+                @if (newTx.amount && newTx.fx_rate) {
+                  <div class="fx-rate-preview">
+                    {{ txTargetAccount?.currency === 'USD' ? '$' : '₸' }}{{ newTx.amount | number:'1.2-2' }}
+                    →
+                    {{ relatedAccountCurrency() === 'USD' ? '$' : '₸' }}{{ convertedPreview() | number:'1.2-2' }}
+                  </div>
+                }
+              </div>
+            } @else if (newTx.type === 'EXCHANGE') {
+              <div class="form-group">
+                <label>FX Rate (USD/KZT)</label>
+                <input type="number" class="form-control" [(ngModel)]="newTx.fx_rate" step="0.01" placeholder="e.g. 455.50">
+              </div>
+            }
+
             <div class="form-group">
               <label>Notes (optional)</label>
               <input type="text" class="form-control" [(ngModel)]="newTx.notes">
@@ -472,6 +501,32 @@ const TX_BADGES: Record<string, string> = {
       50% { border-color: rgba(248,113,113,0.8); }
     }
 
+    /* FX rate control (cross-currency transfer) */
+    .required-mark { color: var(--red); }
+    .fx-rate-hint {
+      display: flex; align-items: center; justify-content: space-between;
+      margin-top: 6px; font-size: 12px; color: var(--text-secondary);
+    }
+    .btn-use-live {
+      background: none; border: 1px solid var(--border-active);
+      color: var(--accent); font-size: 11px; padding: 3px 10px;
+      border-radius: 20px; cursor: pointer; transition: all var(--transition);
+      &:hover { background: var(--accent-dim); border-color: var(--accent-border); }
+    }
+    .form-control.invalid { border-color: rgba(248,113,113,0.4); }
+    .fx-rate-warning {
+      margin-top: 6px; font-size: 11px; line-height: 1.5;
+      color: var(--amber); background: var(--amber-dim);
+      border: 1px solid rgba(251,191,36,0.25); border-radius: var(--radius-sm);
+      padding: 8px 10px;
+    }
+    .fx-rate-preview {
+      margin-top: 8px; font-size: 13px; font-family: var(--font-mono);
+      color: var(--text-primary); background: var(--bg-base);
+      border: 1px solid var(--border); border-radius: var(--radius-sm);
+      padding: 8px 10px; text-align: center;
+    }
+
     /* Toast */
     .toast {
       position: fixed; bottom: 24px; right: 24px; z-index: 9999;
@@ -615,12 +670,50 @@ export class BankComponent implements OnInit {
     this.showTxModal = true;
   }
 
+  // ── Cross-currency transfer helpers ──────────────────────────────────
+
+  isCrossCurrencyTransfer(): boolean {
+    if (!this.txTargetAccount) return false;
+    if (this.newTx.type !== 'TRANSFER_IN' && this.newTx.type !== 'TRANSFER_OUT') return false;
+    const relatedId = this.newTx.related_account_id;
+    if (!relatedId) return false;
+    const related = this.accounts().find(a => a.id === +relatedId);
+    return !!related && related.currency !== this.txTargetAccount.currency;
+  }
+
+  relatedAccountCurrency(): string {
+    const relatedId = this.newTx.related_account_id;
+    const related = this.accounts().find(a => a.id === +(relatedId || 0));
+    return related?.currency || '';
+  }
+
+  useLiveFxRate(): void {
+    this.newTx.fx_rate = this.fxRate();
+  }
+
+  convertedPreview(): number {
+    const amount = +(this.newTx.amount || 0);
+    const rate = +(this.newTx.fx_rate || 0);
+    if (!amount || !rate || !this.txTargetAccount) return 0;
+    // txTargetAccount is the source currency; convert into the related
+    // account's currency for the preview shown to the user.
+    if (this.txTargetAccount.currency === 'USD') return amount * rate; // USD -> KZT
+    return amount / rate; // KZT -> USD
+  }
+
+  // ── Transactions ──────────────────────────────────────────────────────
+
   addTransaction(): void {
     if (!this.txTargetAccount) return;
     if ((this.newTx.type === 'TRANSFER_IN' || this.newTx.type === 'TRANSFER_OUT') && !this.newTx.related_account_id) {
       this.txError = 'Select the other account for this transfer.';
       return;
     }
+    if (this.isCrossCurrencyTransfer() && !this.newTx.fx_rate) {
+      this.txError = `Enter an FX rate — this transfer moves money between a ${this.txTargetAccount.currency} account and a ${this.relatedAccountCurrency()} account.`;
+      return;
+    }
+
     this.txModalLoading = true; this.txError = '';
     const payload: BankTransactionCreate = {
       type: this.newTx.type!,
@@ -630,11 +723,10 @@ export class BankComponent implements OnInit {
       related_account_id: this.newTx.related_account_id || undefined,
       notes: this.newTx.notes || undefined,
     };
-    // The backend now auto-creates the mirrored leg on the related account
-    // for TRANSFER_IN/TRANSFER_OUT, so both accounts' balances changed —
-    // not just the one we posted to — and we need to know the related
-    // account's id up front so we can refresh its transaction list too if
-    // it happens to be the one currently selected on screen.
+    // The backend auto-creates the mirrored leg on the related account for
+    // TRANSFER_IN/TRANSFER_OUT (converting via fx_rate when currencies
+    // differ), so both accounts' balances may have changed — not just the
+    // one we posted to.
     const isTransfer = (payload.type === 'TRANSFER_IN' || payload.type === 'TRANSFER_OUT') && !!payload.related_account_id;
     const relatedAccountId = payload.related_account_id;
     const postedToAccountId = this.txTargetAccount.id;
@@ -681,7 +773,8 @@ export class BankComponent implements OnInit {
       next: () => {
         this.selectedTxs.update(txs => txs.filter(t => t.id !== transactionId));
         this.deletingTxId.set(null);
-        // Refresh account to get updated balance
+        // Refresh account to get updated balance (and the related account's
+        // balance too, if this was one leg of a transfer pair).
         this.api.listBankAccounts().subscribe(accs => this.accounts.set(accs));
       },
       error: (e) => {
