@@ -13,8 +13,6 @@ from app.core.logging_config import configure_logging
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     # Startup
-    async with engine.begin() as conn:
-        await conn.run_sync(Base.metadata.create_all)
     await get_redis()  # warm up Redis connection (fails gracefully)
     yield
     # Shutdown
