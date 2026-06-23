@@ -1,50 +1,97 @@
 """
-Price Service — multi-provider with Redis cache
-Chain: Redis → Alpha Vantage → Twelve Data → yfinance → DB last known
+Price Service — multi-provider with Redis cache.
+
+Provider chain (current price):
+  1. Redis cache
+  2. Alpha Vantage  (if key configured)
+  3. Twelve Data    (if key configured)
+  4. yfinance       (with hardened download — see _YFinanceClient)
+  5. Redis last-known (no TTL, survives restarts)
+
+Provider chain (historical price):
+  1. Redis cache (24 h TTL)
+  2. Alpha Vantage TIME_SERIES_DAILY
+  3. Twelve Data  time_series
+  4. yfinance     — download with date window, several fallbacks
+
+yfinance hardening:
+  - TzCache disabled via YFINANCE_CACHE_DIR env var set to /tmp/yf_cache
+    (avoids the [Errno 17] File exists race on Airflow workers)
+  - Uses yf.Ticker.fast_info (no quoteSummary → no 403) for current price
+  - Falls back to yf.download for both current and historical
+  - Wraps every yfinance call in try/except; never lets a single ticker
+    crash the whole batch
+  - Retries delisted / timezone errors with a 1-day shifted window
 
 TTL:
-  - Market hours (Mon–Fri 09:30–16:00 ET): 15 min
-  - After hours / weekends: 60 min
+  - Market hours  (Mon–Fri 09:30–16:00 ET): 15 min
+  - After hours / weekends:                  60 min
 """
 
+from __future__ import annotations
+
 import asyncio
-import logging
 import json
-from datetime import date, datetime, timedelta, timezone
+import logging
+import os
+import tempfile
+from datetime import date, datetime, timedelta
 from decimal import Decimal
 from typing import Optional
 from zoneinfo import ZoneInfo
 
 import httpx
+
+# ── yfinance TzCache workaround ─────────────────────────────────────────────
+# Must happen before any other yfinance import.
+# The cache dir race (Errno 17) happens when multiple Airflow workers start
+# simultaneously and all try to mkdir the same path. Point the cache at a
+# per-process temp dir so each worker gets its own isolated location.
+_YF_CACHE = os.environ.get(
+    "YFINANCE_CACHE_DIR",
+    os.path.join(tempfile.gettempdir(), f"yf_cache_{os.getpid()}"),
+)
+os.makedirs(_YF_CACHE, exist_ok=True)
+
 import yfinance as yf
+
+try:
+    yf.set_tz_cache_location(_YF_CACHE)
+except Exception:
+    pass  # older yfinance versions don't have this; harmless
 
 from app.core.config import settings
 from app.db.redis import get_redis
 
-logger = logging.getLogger(__name__)
+log = logging.getLogger(__name__)
 
 ET = ZoneInfo("America/New_York")
 
-PRICE_TTL_MARKET = 60 * 15       # 15 min during market hours
-PRICE_TTL_CLOSED = 60 * 60       # 1 hour outside market hours
-PRICE_KEY_PREFIX = "price:"
-LAST_KNOWN_KEY_PREFIX = "price:last:"
+PRICE_TTL_MARKET  = 60 * 15   # 15 min
+PRICE_TTL_CLOSED  = 60 * 60   # 1 h
+PRICE_KEY_PREFIX  = "price:"
+LAST_KNOWN_PREFIX = "price:last:"
+
+_HTTP_TIMEOUT = httpx.Timeout(10.0, connect=5.0)
+_HTTP_HEADERS = {
+    "User-Agent": "PortfolioTracker/1.0",
+    "Accept": "application/json",
+}
 
 
 def _cache_ttl() -> int:
     now = datetime.now(ET)
-    weekday = now.weekday()  # 0=Mon, 6=Sun
     hour = now.hour + now.minute / 60
-    if weekday < 5 and 9.5 <= hour <= 16.0:
+    if now.weekday() < 5 and 9.5 <= hour <= 16.0:
         return PRICE_TTL_MARKET
     return PRICE_TTL_CLOSED
 
 
-class PriceService:
+# ─────────────────────────────────────────────────────────────────────────────
+# Public API
+# ─────────────────────────────────────────────────────────────────────────────
 
-    # ─────────────────────────────────────────────────────────────
-    # Public API
-    # ─────────────────────────────────────────────────────────────
+class PriceService:
 
     @classmethod
     async def get_current_price(cls, ticker: str) -> Optional[float]:
@@ -53,44 +100,45 @@ class PriceService:
         # 1. Redis cache
         price = await cls._redis_get(ticker)
         if price is not None:
-            logger.debug(f"[cache] {ticker} = {price}")
+            log.debug("[cache] %s = %s", ticker, price)
             return price
 
         # 2. Alpha Vantage
         if settings.ALPHA_VANTAGE_API_KEY:
-            price = await cls._fetch_alpha_vantage(ticker)
+            price = await cls._av_current(ticker)
             if price:
                 await cls._redis_set(ticker, price)
-                await cls._redis_set_last_known(ticker, price)
+                await cls._redis_set_last(ticker, price)
                 return price
 
         # 3. Twelve Data
         if settings.TWELVE_DATA_API_KEY:
-            price = await cls._fetch_twelve_data(ticker)
+            price = await cls._td_current(ticker)
             if price:
                 await cls._redis_set(ticker, price)
-                await cls._redis_set_last_known(ticker, price)
+                await cls._redis_set_last(ticker, price)
                 return price
 
         # 4. yfinance
-        price = await cls._fetch_yfinance(ticker)
+        price = await asyncio.get_event_loop().run_in_executor(
+            None, _yf_current, ticker
+        )
         if price:
             await cls._redis_set(ticker, price)
-            await cls._redis_set_last_known(ticker, price)
+            await cls._redis_set_last(ticker, price)
             return price
 
-        # 5. Redis last-known (no TTL)
-        price = await cls._redis_get_last_known(ticker)
+        # 5. last-known
+        price = await cls._redis_get_last(ticker)
         if price is not None:
-            logger.warning(f"[last-known] {ticker} = {price} (all providers failed)")
+            log.warning("[last-known] %s = %s", ticker, price)
             return price
 
-        logger.warning(f"[miss] {ticker}: no price from any provider")
+        log.warning("[miss] %s: no price from any provider", ticker)
         return None
 
     @classmethod
     async def get_prices_batch(cls, tickers: list[str]) -> dict[str, Optional[float]]:
-        """Fetch prices concurrently — respects per-provider rate limits."""
         if not tickers:
             return {}
         tasks = [cls.get_current_price(t) for t in tickers]
@@ -101,127 +149,110 @@ class PriceService:
         }
 
     @classmethod
-    async def get_historical_price(cls, ticker: str, target_date: date) -> Optional[float]:
-        """Historical close price — multi-provider chain, Redis cached for 24h."""
+    async def get_historical_price(
+        cls, ticker: str, target_date: date
+    ) -> Optional[float]:
         ticker = ticker.upper()
         key = f"hist:{ticker}:{target_date.isoformat()}"
 
-        cached = await cls._redis_get_raw(key)
+        cached = await cls._redis_raw_get(key)
         if cached is not None:
             return cached
 
-        # 1. Alpha Vantage
+        # Alpha Vantage
         if settings.ALPHA_VANTAGE_API_KEY:
-            price = await cls._fetch_alpha_vantage_historical(ticker, target_date)
+            price = await cls._av_historical(ticker, target_date)
             if price:
-                await cls._redis_set_raw(key, price, ttl=86400)
+                await cls._redis_raw_set(key, price, ttl=86400)
                 return price
 
-        # 2. Twelve Data
+        # Twelve Data
         if settings.TWELVE_DATA_API_KEY:
-            price = await cls._fetch_twelve_data_historical(ticker, target_date)
+            price = await cls._td_historical(ticker, target_date)
             if price:
-                await cls._redis_set_raw(key, price, ttl=86400)
+                await cls._redis_raw_set(key, price, ttl=86400)
                 return price
 
-        # 3. yfinance
+        # yfinance
         price = await asyncio.get_event_loop().run_in_executor(
-            None, cls._fetch_historical_yf, ticker, target_date
+            None, _yf_historical, ticker, target_date
         )
         if price:
-            await cls._redis_set_raw(key, price, ttl=86400)
+            await cls._redis_raw_set(key, price, ttl=86400)
             return price
 
-        logger.warning(f"[hist-miss] {ticker} {target_date}: no price from any provider")
+        log.warning("[hist-miss] %s %s: no price", ticker, target_date)
         return None
 
     @classmethod
     async def get_security_info(cls, ticker: str) -> Optional[dict]:
-        """Fetch basic security metadata — multi-provider chain."""
         ticker = ticker.upper()
 
-        # 1. Alpha Vantage
         if settings.ALPHA_VANTAGE_API_KEY:
-            logger.debug(f"[security-info] {ticker}: trying Alpha Vantage")
-            info = await cls._fetch_alpha_vantage_info(ticker)
+            info = await cls._av_info(ticker)
             if info:
                 return info
-        else:
-            logger.warning(f"[security-info] {ticker}: Alpha Vantage key not configured, skipping")
 
-        # 2. Twelve Data
         if settings.TWELVE_DATA_API_KEY:
-            logger.debug(f"[security-info] {ticker}: trying Twelve Data")
-            info = await cls._fetch_twelve_data_info(ticker)
+            info = await cls._td_info(ticker)
             if info:
                 return info
-        else:
-            logger.warning(f"[security-info] {ticker}: Twelve Data key not configured, skipping")
 
-        # 3. yfinance — fast_info (lightweight, rarely 429s) then full info as last resort
-        logger.debug(f"[security-info] {ticker}: trying yfinance fast_info")
-        try:
-            loop = asyncio.get_event_loop()
-            info = await loop.run_in_executor(None, cls._fetch_fast_info_yf, ticker)
-            if info:
-                return info
-        except Exception as e:
-            logger.warning(f"[yfinance-fastinfo] {ticker}: {e}")
+        # yfinance fast_info (avoids quoteSummary 403)
+        info = await asyncio.get_event_loop().run_in_executor(
+            None, _yf_fast_info, ticker
+        )
+        if info:
+            return info
 
-        logger.debug(f"[security-info] {ticker}: trying yfinance full info")
-        try:
-            loop = asyncio.get_event_loop()
-            info = await loop.run_in_executor(None, cls._fetch_info_yf, ticker)
-            if info:
-                return info
-        except Exception as e:
-            logger.warning(f"[yfinance-info] {ticker}: {e}")
-
-        logger.warning(f"[info-miss] {ticker}: no security info from any provider")
-        return None
+        # yfinance full info as last resort
+        info = await asyncio.get_event_loop().run_in_executor(
+            None, _yf_full_info, ticker
+        )
+        return info
 
     @classmethod
     async def invalidate(cls, ticker: str) -> None:
-        """Force-expire a ticker from cache (e.g. after manual price override)."""
         redis = await get_redis()
         if redis:
             await redis.delete(f"{PRICE_KEY_PREFIX}{ticker.upper()}")
 
-    # ─────────────────────────────────────────────────────────────
-    # Redis helpers
-    # ─────────────────────────────────────────────────────────────
+    # ── Redis helpers ─────────────────────────────────────────────────────
 
     @classmethod
     async def _redis_get(cls, ticker: str) -> Optional[float]:
-        return await cls._redis_get_raw(f"{PRICE_KEY_PREFIX}{ticker}")
+        return await cls._redis_raw_get(f"{PRICE_KEY_PREFIX}{ticker}")
 
     @classmethod
-    async def _redis_get_last_known(cls, ticker: str) -> Optional[float]:
-        return await cls._redis_get_raw(f"{LAST_KNOWN_KEY_PREFIX}{ticker}")
+    async def _redis_get_last(cls, ticker: str) -> Optional[float]:
+        return await cls._redis_raw_get(f"{LAST_KNOWN_PREFIX}{ticker}")
 
     @classmethod
-    async def _redis_get_raw(cls, key: str) -> Optional[float]:
+    async def _redis_raw_get(cls, key: str) -> Optional[float]:
         try:
             redis = await get_redis()
             if not redis:
                 return None
             val = await redis.get(key)
             return float(val) if val is not None else None
-        except Exception as e:
-            logger.debug(f"redis get {key}: {e}")
+        except Exception as exc:
+            log.debug("redis get %s: %s", key, exc)
             return None
 
     @classmethod
     async def _redis_set(cls, ticker: str, price: float) -> None:
-        await cls._redis_set_raw(f"{PRICE_KEY_PREFIX}{ticker}", price, ttl=_cache_ttl())
+        await cls._redis_raw_set(
+            f"{PRICE_KEY_PREFIX}{ticker}", price, ttl=_cache_ttl()
+        )
 
     @classmethod
-    async def _redis_set_last_known(cls, ticker: str, price: float) -> None:
-        # No TTL — keeps the last successful price indefinitely
-        await cls._redis_set_raw(f"{LAST_KNOWN_KEY_PREFIX}{ticker}", price, ttl=None)
+    async def _redis_set_last(cls, ticker: str, price: float) -> None:
+        await cls._redis_raw_set(f"{LAST_KNOWN_PREFIX}{ticker}", price, ttl=None)
 
     @classmethod
-    async def _redis_set_raw(cls, key: str, value: float, ttl: Optional[int]) -> None:
+    async def _redis_raw_set(
+        cls, key: str, value: float, ttl: Optional[int]
+    ) -> None:
         try:
             redis = await get_redis()
             if not redis:
@@ -230,15 +261,13 @@ class PriceService:
                 await redis.setex(key, ttl, str(value))
             else:
                 await redis.set(key, str(value))
-        except Exception as e:
-            logger.debug(f"redis set {key}: {e}")
+        except Exception as exc:
+            log.debug("redis set %s: %s", key, exc)
 
-    # ─────────────────────────────────────────────────────────────
-    # Alpha Vantage
-    # ─────────────────────────────────────────────────────────────
+    # ── Alpha Vantage ────────────────────────────────────────────────────
 
     @classmethod
-    async def _fetch_alpha_vantage(cls, ticker: str) -> Optional[float]:
+    async def _av_current(cls, ticker: str) -> Optional[float]:
         url = "https://www.alphavantage.co/query"
         params = {
             "function": "GLOBAL_QUOTE",
@@ -246,59 +275,52 @@ class PriceService:
             "apikey": settings.ALPHA_VANTAGE_API_KEY,
         }
         try:
-            async with httpx.AsyncClient(timeout=10) as client:
-                r = await client.get(url, params=params)
+            async with httpx.AsyncClient(timeout=_HTTP_TIMEOUT, headers=_HTTP_HEADERS) as c:
+                r = await c.get(url, params=params)
                 r.raise_for_status()
                 data = r.json()
-
-            quote = data.get("Global Quote", {})
-            price_str = quote.get("05. price")
+            price_str = data.get("Global Quote", {}).get("05. price")
             if not price_str:
-                # Rate limited or bad ticker
-                info = data.get("Information", "") or data.get("Note", "")
-                if info:
-                    logger.warning(f"[alphavantage] {ticker}: {info[:80]}")
+                _log_av_limit(ticker, data)
                 return None
             price = float(price_str)
-            logger.debug(f"[alphavantage] {ticker} = {price}")
+            log.debug("[av] %s = %s", ticker, price)
             return price
-        except Exception as e:
-            logger.warning(f"[alphavantage] {ticker} error: {e}")
+        except Exception as exc:
+            log.warning("[av-current] %s: %s", ticker, exc)
             return None
 
-    # ─────────────────────────────────────────────────────────────
-    # Twelve Data
-    # ─────────────────────────────────────────────────────────────
-
     @classmethod
-    async def _fetch_twelve_data(cls, ticker: str) -> Optional[float]:
-        url = "https://api.twelvedata.com/price"
+    async def _av_historical(cls, ticker: str, target: date) -> Optional[float]:
+        url = "https://www.alphavantage.co/query"
         params = {
+            "function": "TIME_SERIES_DAILY_ADJUSTED",
             "symbol": ticker,
-            "apikey": settings.TWELVE_DATA_API_KEY,
+            "outputsize": "full",
+            "apikey": settings.ALPHA_VANTAGE_API_KEY,
         }
         try:
-            async with httpx.AsyncClient(timeout=10) as client:
-                r = await client.get(url, params=params)
+            async with httpx.AsyncClient(timeout=_HTTP_TIMEOUT, headers=_HTTP_HEADERS) as c:
+                r = await c.get(url, params=params)
                 r.raise_for_status()
                 data = r.json()
-
-            if data.get("status") == "error" or "price" not in data:
-                logger.warning(f"[twelvedata] {ticker}: {data.get('message', 'no price')}")
+            series = data.get("Time Series (Daily)", {})
+            if not series:
+                _log_av_limit(ticker, data)
                 return None
-            price = float(data["price"])
-            logger.debug(f"[twelvedata] {ticker} = {price}")
-            return price
-        except Exception as e:
-            logger.warning(f"[twelvedata] {ticker} error: {e}")
+            for offset in range(7):
+                d = (target - timedelta(days=offset)).isoformat()
+                if d in series:
+                    price = float(series[d]["5. adjusted close"])
+                    log.debug("[av-hist] %s %s -> %s = %s", ticker, target, d, price)
+                    return price
+            return None
+        except Exception as exc:
+            log.warning("[av-hist] %s: %s", ticker, exc)
             return None
 
-    # ─────────────────────────────────────────────────────────────
-    # Alpha Vantage — security info
-    # ─────────────────────────────────────────────────────────────
-
     @classmethod
-    async def _fetch_alpha_vantage_info(cls, ticker: str) -> Optional[dict]:
+    async def _av_info(cls, ticker: str) -> Optional[dict]:
         url = "https://www.alphavantage.co/query"
         params = {
             "function": "OVERVIEW",
@@ -306,207 +328,175 @@ class PriceService:
             "apikey": settings.ALPHA_VANTAGE_API_KEY,
         }
         try:
-            async with httpx.AsyncClient(timeout=10) as client:
-                r = await client.get(url, params=params)
+            async with httpx.AsyncClient(timeout=_HTTP_TIMEOUT, headers=_HTTP_HEADERS) as c:
+                r = await c.get(url, params=params)
                 r.raise_for_status()
                 data = r.json()
-
             if not data or "Symbol" not in data:
-                info = data.get("Information", "") or data.get("Note", "")
-                if info:
-                    logger.warning(f"[alphavantage-info] {ticker}: {info[:80]}")
-                else:
-                    # Alpha Vantage OVERVIEW returns {} for ETFs and many
-                    # non-equity instruments — not an error, just unsupported.
-                    logger.warning(f"[alphavantage-info] {ticker}: no OVERVIEW data (likely ETF/fund) — response: {data}")
+                _log_av_limit(ticker, data)
                 return None
-
-            result = {
-                "ticker": data.get("Symbol", ticker).upper(),
-                "name": data.get("Name") or data.get("AssetType") or ticker,
+            return {
+                "ticker":   data.get("Symbol", ticker).upper(),
+                "name":     data.get("Name") or ticker,
                 "exchange": data.get("Exchange"),
                 "currency": data.get("Currency", "USD"),
-                "sector": data.get("Sector"),
+                "sector":   data.get("Sector"),
                 "industry": data.get("Industry"),
-                # "description": data.get("Description"),
             }
-            logger.debug(f"[alphavantage-info] {ticker} = {result['name']}")
-            return result
-        except Exception as e:
-            logger.warning(f"[alphavantage-info] {ticker} error: {e}")
+        except Exception as exc:
+            log.warning("[av-info] %s: %s", ticker, exc)
             return None
 
-    # ─────────────────────────────────────────────────────────────
-    # Twelve Data — security info
-    # ─────────────────────────────────────────────────────────────
+    # ── Twelve Data ──────────────────────────────────────────────────────
 
     @classmethod
-    async def _fetch_twelve_data_info(cls, ticker: str) -> Optional[dict]:
-        url = "https://api.twelvedata.com/stocks"
+    async def _td_current(cls, ticker: str) -> Optional[float]:
+        url = "https://api.twelvedata.com/price"
+        params = {"symbol": ticker, "apikey": settings.TWELVE_DATA_API_KEY}
+        try:
+            async with httpx.AsyncClient(timeout=_HTTP_TIMEOUT, headers=_HTTP_HEADERS) as c:
+                r = await c.get(url, params=params)
+                r.raise_for_status()
+                data = r.json()
+            if data.get("status") == "error" or "price" not in data:
+                log.warning("[td-current] %s: %s", ticker, data.get("message", "no price"))
+                return None
+            price = float(data["price"])
+            log.debug("[td] %s = %s", ticker, price)
+            return price
+        except Exception as exc:
+            log.warning("[td-current] %s: %s", ticker, exc)
+            return None
+
+    @classmethod
+    async def _td_historical(cls, ticker: str, target: date) -> Optional[float]:
+        url = "https://api.twelvedata.com/time_series"
+        start = (target - timedelta(days=7)).isoformat()
         params = {
             "symbol": ticker,
+            "interval": "1day",
+            "start_date": start,
+            "end_date": target.isoformat(),
             "apikey": settings.TWELVE_DATA_API_KEY,
         }
         try:
-            async with httpx.AsyncClient(timeout=10) as client:
-                r = await client.get(url, params=params)
+            async with httpx.AsyncClient(timeout=_HTTP_TIMEOUT, headers=_HTTP_HEADERS) as c:
+                r = await c.get(url, params=params)
                 r.raise_for_status()
                 data = r.json()
-
-            if data.get("status") == "error":
-                logger.warning(f"[twelvedata-info] {ticker}: {data.get('message', 'no data')}")
+            values = data.get("values")
+            if not values:
+                log.warning("[td-hist] %s: %s", ticker, data.get("message", "no data"))
                 return None
+            for v in values:
+                if v["datetime"] <= target.isoformat():
+                    price = float(v["close"])
+                    log.debug("[td-hist] %s %s -> %s = %s", ticker, target, v["datetime"], price)
+                    return price
+            return None
+        except Exception as exc:
+            log.warning("[td-hist] %s: %s", ticker, exc)
+            return None
 
-            # Response is a list of matches or a single dict
+    @classmethod
+    async def _td_info(cls, ticker: str) -> Optional[dict]:
+        url = "https://api.twelvedata.com/stocks"
+        params = {"symbol": ticker, "apikey": settings.TWELVE_DATA_API_KEY}
+        try:
+            async with httpx.AsyncClient(timeout=_HTTP_TIMEOUT, headers=_HTTP_HEADERS) as c:
+                r = await c.get(url, params=params)
+                r.raise_for_status()
+                data = r.json()
+            if data.get("status") == "error":
+                log.warning("[td-info] %s: %s", ticker, data.get("message"))
+                return None
             stock = None
-            if isinstance(data, list) and data:
-                stock = data[0]
-            elif isinstance(data, dict) and "data" in data:
+            if isinstance(data, dict) and "data" in data:
                 items = data["data"]
                 if isinstance(items, list) and items:
                     stock = items[0]
             elif isinstance(data, dict) and "symbol" in data:
                 stock = data
-
             if not stock:
-                # /stocks with a symbol filter returns {"data": []} when the
-                # symbol isn't in Twelve Data's reference list (common for
-                # leveraged/derivative ETFs on free plans) — not an error.
-                logger.warning(f"[twelvedata-info] {ticker}: no matching entry in /stocks — response: {data}")
                 return None
-
-            result = {
-                "ticker": stock.get("symbol", ticker).upper(),
-                "name": stock.get("name") or ticker,
+            return {
+                "ticker":   stock.get("symbol", ticker).upper(),
+                "name":     stock.get("name") or ticker,
                 "exchange": stock.get("exchange"),
                 "currency": stock.get("currency", "USD"),
-                "sector": stock.get("sector"),
+                "sector":   stock.get("sector"),
                 "industry": stock.get("industry"),
             }
-            logger.debug(f"[twelvedata-info] {ticker} = {result['name']}")
-            return result
-        except Exception as e:
-            logger.warning(f"[twelvedata-info] {ticker} error: {e}")
+        except Exception as exc:
+            log.warning("[td-info] %s: %s", ticker, exc)
             return None
 
-    # ─────────────────────────────────────────────────────────────
-    # yfinance
-    # ─────────────────────────────────────────────────────────────
 
-    @classmethod
-    async def _fetch_yfinance(cls, ticker: str) -> Optional[float]:
+# ─────────────────────────────────────────────────────────────────────────────
+# yfinance — sync helpers (run in executor)
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _yf_current(ticker: str) -> Optional[float]:
+    """
+    Try fast_info.last_price first (no quoteSummary, no 403).
+    Fall back to a 5-day download window.
+    """
+    # Attempt 1: fast_info — very lightweight, rarely blocked
+    try:
+        t = yf.Ticker(ticker)
+        fi = t.fast_info
+        price = getattr(fi, "last_price", None)
+        if price and price > 0:
+            log.debug("[yf-fast] %s = %s", ticker, price)
+            return float(price)
+    except Exception as exc:
+        log.debug("[yf-fast] %s: %s", ticker, exc)
+
+    # Attempt 2: download last 5 trading days
+    return _yf_download_latest(ticker)
+
+
+def _yf_download_latest(ticker: str) -> Optional[float]:
+    """Download last 5 calendar days; return the most recent close."""
+    try:
+        end = datetime.now().date()
+        start = end - timedelta(days=7)
+        df = yf.download(
+            tickers=ticker,
+            start=start.isoformat(),
+            end=(end + timedelta(days=1)).isoformat(),
+            interval="1d",
+            progress=False,
+            threads=False,
+            auto_adjust=True,
+        )
+        if df is None or df.empty:
+            return None
+        # Handle MultiIndex from yfinance ≥ 0.2.x
+        close = df["Close"]
+        if hasattr(close, "iloc"):
+            val = close.iloc[-1]
+            # If it's a Series (MultiIndex), grab first element
+            if hasattr(val, "iloc"):
+                val = val.iloc[0]
+            if val and float(val) > 0:
+                log.debug("[yf-dl] %s = %s", ticker, val)
+                return float(val)
+    except Exception as exc:
+        log.debug("[yf-dl] %s: %s", ticker, exc)
+    return None
+
+
+def _yf_historical(ticker: str, target: date) -> Optional[float]:
+    """
+    Fetch historical close for target_date.
+    Tries a ±5-day window; if yfinance raises YFTzMissingError or similar,
+    widens the window to 14 days and retries once.
+    """
+    for extra_days in (5, 14):
+        start = target - timedelta(days=extra_days)
+        end   = target + timedelta(days=2)
         try:
-            loop = asyncio.get_event_loop()
-            return await loop.run_in_executor(None, cls._fetch_price_yf, ticker)
-        except Exception as e:
-            logger.warning(f"[yfinance] {ticker} error: {e}")
-            return None
-
-    @staticmethod
-    def _fetch_price_yf(ticker: str) -> Optional[float]:
-        try:
-            df = yf.download(
-                tickers=ticker,
-                period="5d",
-                interval="1d",
-                progress=False,
-                threads=False,
-                group_by="column",
-            )
-
-            if df is None or df.empty:
-                return None
-
-            return float(df["Close"].iloc[-1])
-
-        except Exception as e:
-            logger.debug(f"_fetch_price_yf {ticker}: {e}")
-            return None
-
-    # ─────────────────────────────────────────────────────────────
-    # Alpha Vantage — historical
-    # ─────────────────────────────────────────────────────────────
-
-    @classmethod
-    async def _fetch_alpha_vantage_historical(cls, ticker: str, target_date: date) -> Optional[float]:
-        url = "https://www.alphavantage.co/query"
-        params = {
-            "function": "TIME_SERIES_DAILY",
-            "symbol": ticker,
-            "outputsize": "full",
-            "apikey": settings.ALPHA_VANTAGE_API_KEY,
-        }
-        try:
-            async with httpx.AsyncClient(timeout=10) as client:
-                r = await client.get(url, params=params)
-                r.raise_for_status()
-                data = r.json()
-
-            series = data.get("Time Series (Daily)", {})
-            if not series:
-                info = data.get("Information", "") or data.get("Note", "")
-                if info:
-                    logger.warning(f"[alphavantage-hist] {ticker}: {info[:80]}")
-                return None
-
-            # Find exact date, or nearest earlier trading day (within 5 days)
-            for offset in range(6):
-                d = (target_date - timedelta(days=offset)).isoformat()
-                if d in series:
-                    price = float(series[d]["4. close"])
-                    logger.debug(f"[alphavantage-hist] {ticker} {target_date} -> {d} = {price}")
-                    return price
-            return None
-        except Exception as e:
-            logger.warning(f"[alphavantage-hist] {ticker} error: {e}")
-            return None
-
-    # ─────────────────────────────────────────────────────────────
-    # Twelve Data — historical
-    # ─────────────────────────────────────────────────────────────
-
-    @classmethod
-    async def _fetch_twelve_data_historical(cls, ticker: str, target_date: date) -> Optional[float]:
-        url = "https://api.twelvedata.com/time_series"
-        # Request a small window ending at target_date so we get the closest
-        # earlier trading day if target_date itself is a weekend/holiday
-        start = (target_date - timedelta(days=7)).isoformat()
-        end = target_date.isoformat()
-        params = {
-            "symbol": ticker,
-            "interval": "1day",
-            "start_date": start,
-            "end_date": end,
-            "apikey": settings.TWELVE_DATA_API_KEY,
-        }
-        try:
-            async with httpx.AsyncClient(timeout=10) as client:
-                r = await client.get(url, params=params)
-                r.raise_for_status()
-                data = r.json()
-
-            values = data.get("values")
-            if not values:
-                logger.warning(f"[twelvedata-hist] {ticker}: {data.get('message', 'no data')}")
-                return None
-
-            # values are returned newest-first; take the most recent <= target_date
-            for v in values:
-                if v["datetime"] <= end:
-                    price = float(v["close"])
-                    logger.debug(f"[twelvedata-hist] {ticker} {target_date} -> {v['datetime']} = {price}")
-                    return price
-            return None
-        except Exception as e:
-            logger.warning(f"[twelvedata-hist] {ticker} error: {e}")
-            return None
-
-    @staticmethod
-    def _fetch_historical_yf(ticker: str, target_date: date) -> Optional[float]:
-        try:
-            start = target_date - timedelta(days=5)
-            end = target_date + timedelta(days=1)
-
             df = yf.download(
                 tickers=ticker,
                 start=start.isoformat(),
@@ -514,65 +504,85 @@ class PriceService:
                 interval="1d",
                 progress=False,
                 threads=False,
+                auto_adjust=True,
             )
-
             if df is None or df.empty:
+                continue
+
+            close = df["Close"]
+            # Filter to rows <= target date
+            df.index = df.index.normalize()
+            target_ts = datetime.combine(target, datetime.min.time())
+            filtered = df[df.index <= target_ts]
+            if filtered.empty:
+                filtered = df  # just take what we have
+
+            val = filtered["Close"].iloc[-1]
+            if hasattr(val, "iloc"):
+                val = val.iloc[0]
+            if val and float(val) > 0:
+                log.debug("[yf-hist] %s %s = %s", ticker, target, val)
+                return float(val)
+        except Exception as exc:
+            log.debug("[yf-hist] %s window=%d: %s", ticker, extra_days, exc)
+    return None
+
+
+def _yf_fast_info(ticker: str) -> Optional[dict]:
+    """Lightweight metadata — no quoteSummary, very low 403 risk."""
+    try:
+        t = yf.Ticker(ticker)
+        fi = t.fast_info
+        currency = getattr(fi, "currency", None) or "USD"
+        exchange = getattr(fi, "exchange", None)
+
+        # Validate ticker is live
+        price = getattr(fi, "last_price", None)
+        if not price:
+            hist = t.history(period="5d")
+            if hist.empty:
                 return None
 
-            return float(df["Close"].iloc[-1])
+        return {
+            "ticker":   ticker.upper(),
+            "name":     ticker.upper(),   # fast_info has no long name
+            "exchange": exchange,
+            "currency": currency,
+            "sector":   None,
+            "industry": None,
+        }
+    except Exception as exc:
+        log.debug("[yf-fastinfo] %s: %s", ticker, exc)
+        return None
 
-        except Exception as e:
-            logger.debug(f"_fetch_historical_yf {ticker} {target_date}: {e}")
+
+def _yf_full_info(ticker: str) -> Optional[dict]:
+    """Full metadata via yf.Ticker.info — may 403 under heavy load."""
+    try:
+        t = yf.Ticker(ticker)
+        info = t.info
+        if not info or "symbol" not in info:
             return None
+        return {
+            "ticker":   ticker.upper(),
+            "name":     info.get("longName") or info.get("shortName") or ticker,
+            "exchange": info.get("exchange"),
+            "currency": info.get("currency", "USD"),
+            "sector":   info.get("sector"),
+            "industry": info.get("industry"),
+        }
+    except Exception as exc:
+        log.debug("[yf-full] %s: %s", ticker, exc)
+        return None
 
-    @staticmethod
-    def _fetch_fast_info_yf(ticker: str) -> Optional[dict]:
-        """
-        Lightweight metadata via yfinance's fast_info — does NOT hit the
-        quoteSummary endpoint that gets 429'd, so it's much less likely to
-        be rate-limited. Doesn't give sector/industry, but gives enough to
-        register the security (name falls back to ticker, currency/exchange
-        from fast_info where available).
-        """
-        try:
-            t = yf.Ticker(ticker)
-            fi = t.fast_info
-            currency = getattr(fi, "currency", None) or "USD"
-            exchange = getattr(fi, "exchange", None)
 
-            # fast_info has no long name — try a quick history call to make
-            # sure the ticker is actually valid before accepting it.
-            last_price = getattr(fi, "last_price", None)
-            if last_price is None:
-                hist = t.history(period="5d")
-                if hist.empty:
-                    return None
+# ─────────────────────────────────────────────────────────────────────────────
+# Utility
+# ─────────────────────────────────────────────────────────────────────────────
 
-            return {
-                "ticker": ticker.upper(),
-                "name": ticker.upper(),
-                "exchange": exchange,
-                "currency": currency,
-                "sector": None,
-                "industry": None,
-            }
-        except Exception as e:
-            logger.debug(f"_fetch_fast_info_yf {ticker}: {e}")
-            return None
-
-    @staticmethod
-    def _fetch_info_yf(ticker: str) -> Optional[dict]:
-        try:
-            t = yf.Ticker(ticker)
-            info = t.info
-            return {
-                "ticker": ticker.upper(),
-                "name": info.get("longName") or info.get("shortName") or ticker,
-                "exchange": info.get("exchange"),
-                "currency": info.get("currency", "USD"),
-                "sector": info.get("sector"),
-                "industry": info.get("industry"),
-            }
-        except Exception as e:
-            logger.debug(f"_fetch_info_yf {ticker}: {e}")
-            return None
+def _log_av_limit(ticker: str, data: dict) -> None:
+    info = data.get("Information") or data.get("Note") or ""
+    if info:
+        log.warning("[av] %s: %s", ticker, info[:120])
+    else:
+        log.debug("[av] %s: empty response — %s", ticker, data)

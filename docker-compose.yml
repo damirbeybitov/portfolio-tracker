@@ -17,6 +17,8 @@ x-airflow-common: &airflow-common
     # without needing an Airflow Connection configured first.
     APP_DATABASE_URL: postgresql://${POSTGRES_USER:-portfolio}:${POSTGRES_PASSWORD:-portfolio_secret}@db:5432/${POSTGRES_DB:-portfolio_tracker}
     TZ: ${AIRFLOW_TZ:-UTC}
+    ALPHA_VANTAGE_API_KEY: ${ALPHA_VANTAGE_API_KEY:-}
+    TWELVE_DATA_API_KEY: ${TWELVE_DATA_API_KEY:-}
   volumes:
     - ./airflow/dags:/opt/airflow/dags
     - ./airflow/logs:/opt/airflow/logs
