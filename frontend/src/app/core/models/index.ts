@@ -55,7 +55,9 @@ export interface Position {
   profit_percent?: number;
 }
 
-export type TransactionType = 'BUY' | 'SELL' | 'DIVIDEND' | 'TAX' | 'SPLIT' | 'COMMISSION';
+// Only BUY, SELL, SPLIT exist in portfolio transactions now.
+// DIVIDEND, TAX, COMMISSION are bank-only.
+export type TransactionType = 'BUY' | 'SELL' | 'SPLIT';
 
 export interface Transaction {
   id: number;
@@ -69,8 +71,6 @@ export interface Transaction {
   total_usd: number;
   total_kzt: number;
   fx_rate_usd_kzt: number;
-  commission_usd: number;
-  commission_kzt: number;
   split_ratio?: number;
   notes?: string;
   created_at: string;
@@ -83,7 +83,6 @@ export interface TransactionCreate {
   quantity: number;
   price_usd: number;
   fx_rate_usd_kzt?: number;
-  commission_usd: number;
   split_ratio?: number;
   notes?: string;
 }
@@ -168,6 +167,8 @@ export interface OverallSummary {
 
 // Bank
 export type AccountCurrency = 'KZT' | 'USD';
+
+// DIVIDEND, TAX, COMMISSION, EXPENSE live only in bank transactions
 export type BankTransactionType =
   | 'INCOME' | 'EXPENSE' | 'INTEREST' | 'TRANSFER_IN' | 'TRANSFER_OUT'
   | 'STOCK_BUY' | 'STOCK_SELL' | 'DIVIDEND' | 'TAX' | 'COMMISSION' | 'EXCHANGE';
@@ -209,6 +210,12 @@ export interface BankTransaction {
   related_account_id?: number;
   fx_rate?: number;
   notes?: string;
+  // Stock link fields — present for STOCK_BUY / STOCK_SELL
+  ticker?: string;
+  quantity?: number;
+  price_per_share?: number;
+  portfolio_id?: number;
+  linked_portfolio_tx_id?: number;
   created_at: string;
 }
 
@@ -219,6 +226,11 @@ export interface BankTransactionCreate {
   related_account_id?: number;
   fx_rate?: number;
   notes?: string;
+  // Required for STOCK_BUY / STOCK_SELL
+  ticker?: string;
+  quantity?: number;
+  price_per_share?: number;
+  portfolio_id?: number;
 }
 
 export interface FxRate {

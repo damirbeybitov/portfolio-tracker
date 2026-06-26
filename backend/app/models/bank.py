@@ -17,7 +17,7 @@ class AccountCurrency(str, enum.Enum):
 
 class BankTransactionType(str, enum.Enum):
     INCOME = "INCOME"
-    OUTCOME = "EXPENSE"
+    EXPENSE = "EXPENSE"
     INTEREST = "INTEREST"
     TRANSFER_IN = "TRANSFER_IN"
     TRANSFER_OUT = "TRANSFER_OUT"
@@ -68,14 +68,21 @@ class BankTransaction(Base):
     related_account_id: Mapped[int | None] = mapped_column(Integer)
     fx_rate: Mapped[Decimal | None] = mapped_column(Numeric(12, 4))
     notes: Mapped[str | None] = mapped_column(Text)
-    # Links the two legs of an auto-created transfer (TRANSFER_OUT on the
-    # source account + TRANSFER_IN on the destination account) so they can
-    # be reliably found and deleted together, including for cross-currency
-    # transfers where amount differs between the two legs and can't be used
-    # for matching. NULL for every other transaction type (INCOME, EXPENSE,
-    # INTEREST, STOCK_BUY, etc.) — those are single-sided and have nothing
-    # to link to. Both legs of a pair share the same UUID, generated once
-    # at creation time in BankService.add_transaction.
+
+    # ── Stock link fields (populated only for STOCK_BUY / STOCK_SELL) ────
+    # When set, the backend automatically creates / deletes the corresponding
+    # portfolio transaction so the bank tx is the single source of truth for
+    # stock activity.
+    ticker: Mapped[str | None] = mapped_column(String(20))
+    quantity: Mapped[Decimal | None] = mapped_column(Numeric(20, 8))
+    price_per_share: Mapped[Decimal | None] = mapped_column(Numeric(20, 8))
+    portfolio_id: Mapped[int | None] = mapped_column(Integer)
+    # FK to the auto-created portfolio transaction — used to delete it when
+    # this bank tx is deleted.
+    linked_portfolio_tx_id: Mapped[int | None] = mapped_column(Integer)
+
+    # Links the two legs of an auto-created transfer pair so they can be
+    # reliably found and deleted together.
     transfer_group_id: Mapped[uuid.UUID | None] = mapped_column(
         PG_UUID(as_uuid=True), nullable=True, index=True
     )

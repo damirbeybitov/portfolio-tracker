@@ -5,9 +5,7 @@ import {
   AuthResponse, TokenResponse, Portfolio, PortfolioSummary, Transaction, TransactionCreate,
   Security, PortfolioAnalytics, BankSummary, OverallSummary,
   BankAccount, BankAccountCreate, BankInterestRate, BankTransaction, BankTransactionCreate,
-  FxRate, UserResponse,
-  UserSettings,
-  UserSettingsUpdate
+  FxRate, UserResponse, UserSettings, UserSettingsUpdate,
 } from '../models';
 
 const API = '/api/v1';
@@ -16,7 +14,8 @@ const API = '/api/v1';
 export class ApiService {
   constructor(private http: HttpClient) {}
 
-  // Auth
+  // ── Auth ────────────────────────────────────────────────────────────────
+
   register(data: { email: string; username: string; password: string }): Observable<AuthResponse> {
     return this.http.post<AuthResponse>(`${API}/auth/register`, data);
   }
@@ -30,7 +29,8 @@ export class ApiService {
     return this.http.get<UserResponse>(`${API}/auth/me`);
   }
 
-  // Portfolios
+  // ── Portfolios ──────────────────────────────────────────────────────────
+
   listPortfolios(): Observable<Portfolio[]> {
     return this.http.get<Portfolio[]>(`${API}/portfolios`);
   }
@@ -50,7 +50,11 @@ export class ApiService {
     return this.http.post<PortfolioSummary>(`${API}/portfolios/${id}/recalculate`, {});
   }
 
-  // Transactions
+  // ── Portfolio Transactions ──────────────────────────────────────────────
+  // Only BUY, SELL, SPLIT exist here now.
+  // BUY/SELL are auto-created by bank STOCK_BUY/STOCK_SELL transactions.
+  // This endpoint is used directly only for SPLIT.
+
   listTransactions(portfolioId: number): Observable<Transaction[]> {
     return this.http.get<Transaction[]>(`${API}/portfolios/${portfolioId}/transactions`);
   }
@@ -66,7 +70,8 @@ export class ApiService {
     return this.http.delete<void>(`${API}/portfolios/${portfolioId}/transactions/${transactionId}`);
   }
 
-  // Securities
+  // ── Securities ──────────────────────────────────────────────────────────
+
   searchSecurities(q: string): Observable<Security[]> {
     return this.http.get<Security[]>(`${API}/portfolios/securities/search`, { params: { q } });
   }
@@ -74,7 +79,8 @@ export class ApiService {
     return this.http.post<Security>(`${API}/portfolios/securities/lookup/${ticker}`, {});
   }
 
-  // Analytics
+  // ── Analytics ──────────────────────────────────────────────────────────
+
   getPortfolioAnalytics(portfolioId: number): Observable<PortfolioAnalytics> {
     return this.http.get<PortfolioAnalytics>(`${API}/analytics/portfolio/${portfolioId}`);
   }
@@ -85,7 +91,8 @@ export class ApiService {
     return this.http.get<OverallSummary>(`${API}/analytics/overview/${portfolioId}`);
   }
 
-  // Bank accounts
+  // ── Bank accounts ───────────────────────────────────────────────────────
+
   listBankAccounts(): Observable<BankAccount[]> {
     return this.http.get<BankAccount[]>(`${API}/bank/accounts`);
   }
@@ -104,6 +111,10 @@ export class ApiService {
   setBankRate(accountId: number, data: { rate_percent: number; effective_from: string; notes?: string }): Observable<BankInterestRate> {
     return this.http.post<BankInterestRate>(`${API}/bank/accounts/${accountId}/rates`, data);
   }
+
+  // ── Bank transactions ───────────────────────────────────────────────────
+  // STOCK_BUY / STOCK_SELL here auto-create the matching portfolio tx.
+
   listBankTransactions(accountId: number): Observable<BankTransaction[]> {
     return this.http.get<BankTransaction[]>(`${API}/bank/accounts/${accountId}/transactions`);
   }
@@ -118,6 +129,9 @@ export class ApiService {
   deleteBankTransaction(accountId: number, transactionId: number): Observable<void> {
     return this.http.delete<void>(`${API}/bank/accounts/${accountId}/transactions/${transactionId}`);
   }
+
+  // ── FX rates ────────────────────────────────────────────────────────────
+
   getFxRate(date?: string): Observable<FxRate> {
     const params = date ? new HttpParams().set('target_date', date) : new HttpParams();
     return this.http.get<FxRate>(`${API}/bank/fx`, { params });
@@ -126,7 +140,8 @@ export class ApiService {
     return this.http.post<FxRate>(`${API}/bank/fx`, data);
   }
 
-  // Settings
+  // ── Settings ────────────────────────────────────────────────────────────
+
   getSettings(): Observable<UserSettings> {
     return this.http.get<UserSettings>(`${API}/settings`);
   }

@@ -75,13 +75,17 @@ class PositionResponse(BaseModel):
 # ─── Transaction ──────────────────────────────────────────────────────────────
 
 class TransactionCreate(BaseModel):
+    """
+    Used internally (by BankService when auto-creating portfolio transactions)
+    and for SPLIT transactions added directly from the portfolio view.
+    STOCK_BUY / STOCK_SELL are created via bank transactions only.
+    """
     security_id: int
     type: TransactionType
     date: date
     quantity: Decimal = Field(default=Decimal("0"), ge=0)
     price_usd: Decimal = Field(default=Decimal("0"), ge=0)
-    fx_rate_usd_kzt: Optional[Decimal] = None  # auto-fetched if not provided
-    commission_usd: Decimal = Field(default=Decimal("0"), ge=0)
+    fx_rate_usd_kzt: Optional[Decimal] = None
     split_ratio: Optional[Decimal] = None
     notes: Optional[str] = None
 
@@ -98,16 +102,15 @@ class TransactionResponse(BaseModel):
     total_usd: Decimal
     total_kzt: Decimal
     fx_rate_usd_kzt: Decimal
-    commission_usd: Decimal
-    commission_kzt: Decimal
     split_ratio: Optional[Decimal]
     notes: Optional[str]
     created_at: datetime
     model_config = {"from_attributes": True}
 
+
 class TransactionImportRow(BaseModel):
     row: int
-    status: str  # "ok" | "error"
+    status: str
     error: Optional[str] = None
     transaction: Optional[TransactionResponse] = None
 
@@ -117,6 +120,7 @@ class TransactionImportResult(BaseModel):
     imported: int
     failed: int
     results: list[TransactionImportRow]
+
 
 # ─── Portfolio Summary ─────────────────────────────────────────────────────────
 

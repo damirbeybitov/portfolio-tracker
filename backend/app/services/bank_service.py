@@ -1,31 +1,46 @@
+"""
+Bank Service
+
+Key change: STOCK_BUY / STOCK_SELL bank transactions now automatically
+create / delete the matching portfolio transaction so the bank account is
+the single source of truth for stock activity.
+"""
+
 import logging
 import uuid
-from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy import select, and_, desc, func
-from fastapi import HTTPException, status
 from decimal import Decimal
 from datetime import date
 from typing import Optional
 
+from fastapi import HTTPException
+from sqlalchemy import and_, desc, select
+from sqlalchemy.ext.asyncio import AsyncSession
+
 from app.models.bank import BankAccount, BankInterestRate, BankTransaction, BankTransactionType
+from app.models.portfolio import Security
+from app.models.transaction import Transaction, TransactionType
 from app.schemas.bank import (
     BankAccountCreate, BankAccountUpdate, BankAccountResponse,
     BankInterestRateCreate, BankInterestRateResponse,
     BankTransactionCreate, BankTransactionResponse,
     FxRateCreate, FxRateResponse,
 )
+from app.schemas.portfolio import TransactionCreate
 from app.services.fx_service import FxService
 
 logger = logging.getLogger("app.services.bank")
 
-# Transfer types that get an automatic mirrored leg on the related account.
 TRANSFER_MIRROR = {
     BankTransactionType.TRANSFER_OUT: BankTransactionType.TRANSFER_IN,
     BankTransactionType.TRANSFER_IN: BankTransactionType.TRANSFER_OUT,
 }
 
+STOCK_TYPES = {BankTransactionType.STOCK_BUY, BankTransactionType.STOCK_SELL}
+
 
 class BankService:
+
+    # ── Accounts ──────────────────────────────────────────────────────────────
 
     @staticmethod
     async def create_account(db: AsyncSession, user_id: int, data: BankAccountCreate) -> BankAccountResponse:
@@ -33,10 +48,6 @@ class BankService:
         db.add(account)
         await db.flush()
         await db.refresh(account)
-        logger.info(
-            "Bank account created",
-            extra={"user_id": user_id, "account_id": account.id, "currency": account.currency, "name": account.name},
-        )
         resp = BankAccountResponse.model_validate(account)
         resp.current_rate = None
         return resp
@@ -45,7 +56,6 @@ class BankService:
     async def list_accounts(db: AsyncSession, user_id: int) -> list[BankAccountResponse]:
         result = await db.execute(select(BankAccount).where(BankAccount.user_id == user_id))
         accounts = result.scalars().all()
-        logger.debug("Listed bank accounts", extra={"user_id": user_id, "count": len(accounts)})
         enriched = []
         for acc in accounts:
             rate = await BankService._get_current_rate(db, acc.id)
@@ -61,7 +71,6 @@ class BankService:
         )
         acc = result.scalar_one_or_none()
         if not acc:
-            logger.warning("Bank account not found", extra={"user_id": user_id, "account_id": account_id})
             raise HTTPException(status_code=404, detail="Bank account not found")
         return acc
 
@@ -76,15 +85,10 @@ class BankService:
         db: AsyncSession, user_id: int, account_id: int, data: BankAccountUpdate,
     ) -> BankAccountResponse:
         acc = await BankService.get_account_or_404(db, user_id, account_id)
-        changes = data.model_dump(exclude_unset=True)
-        for field, value in changes.items():
+        for field, value in data.model_dump(exclude_unset=True).items():
             setattr(acc, field, value)
         await db.flush()
         await db.refresh(acc)
-        logger.info(
-            "Bank account updated",
-            extra={"user_id": user_id, "account_id": account_id, "fields": list(changes.keys())},
-        )
         rate = await BankService._get_current_rate(db, acc.id)
         resp = BankAccountResponse.model_validate(acc)
         resp.current_rate = rate
@@ -99,29 +103,17 @@ class BankService:
         db.add(rate)
         await db.flush()
         await db.refresh(rate)
-        logger.info(
-            "Interest rate set",
-            extra={
-                "account_id": account_id,
-                "rate_percent": float(data.rate_percent),
-                "effective_from": str(data.effective_from),
-            },
-        )
         return BankInterestRateResponse.model_validate(rate)
 
     @staticmethod
-    async def list_rates(
-        db: AsyncSession, user_id: int, account_id: int,
-    ) -> list[BankInterestRateResponse]:
+    async def list_rates(db: AsyncSession, user_id: int, account_id: int) -> list[BankInterestRateResponse]:
         await BankService.get_account_or_404(db, user_id, account_id)
         result = await db.execute(
             select(BankInterestRate)
             .where(BankInterestRate.account_id == account_id)
             .order_by(desc(BankInterestRate.effective_from))
         )
-        rates = result.scalars().all()
-        logger.debug("Listed interest rates", extra={"account_id": account_id, "count": len(rates)})
-        return [BankInterestRateResponse.model_validate(r) for r in rates]
+        return [BankInterestRateResponse.model_validate(r) for r in result.scalars().all()]
 
     @staticmethod
     async def _get_current_rate(db: AsyncSession, account_id: int) -> Optional[Decimal]:
@@ -137,6 +129,8 @@ class BankService:
         r = result.scalar_one_or_none()
         return r.rate_percent if r else None
 
+    # ── Transactions ──────────────────────────────────────────────────────────
+
     @staticmethod
     async def add_transaction(
         db: AsyncSession, user_id: int, account_id: int, data: BankTransactionCreate,
@@ -144,21 +138,12 @@ class BankService:
         """
         Add a bank transaction.
 
-        For TRANSFER_IN / TRANSFER_OUT with a related_account_id set, this
-        automatically creates the mirrored leg on the related account in the
-        same DB transaction, so a single "Transfer" action in the UI produces
-        a balanced pair of entries instead of requiring the user to create
-        each side manually. Both legs commit together or not at all.
+        For STOCK_BUY/STOCK_SELL: auto-creates the matching portfolio
+        transaction and stores its id in linked_portfolio_tx_id so it can be
+        found and deleted when this bank tx is removed.
 
-        Cross-currency transfers: `amount` is always denominated in the
-        account you're posting to (account_id), i.e. the source account for
-        a TRANSFER_OUT. If the related account uses a different currency,
-        the mirrored leg's amount is converted using the USD/KZT rate
-        (either the one supplied on the request, or — if omitted — the
-        current rate from FxService) before being applied to that account's
-        balance. Without this conversion, a $100 transfer from a USD account
-        to a KZT account would otherwise credit the KZT account exactly
-        100 KZT instead of ~100 * fx_rate KZT — silently destroying value.
+        For TRANSFER_IN/TRANSFER_OUT with related_account_id: auto-creates
+        the mirrored leg on the other account (existing behaviour).
         """
         account = await BankService.get_account_or_404(db, user_id, account_id)
 
@@ -166,49 +151,45 @@ class BankService:
         if data.related_account_id:
             if data.related_account_id == account_id:
                 raise HTTPException(status_code=422, detail="Related account cannot be the same account")
-
             related_account = await BankService.get_account_or_404(db, user_id, data.related_account_id)
 
-        # Both legs of an auto-mirrored transfer share one transfer_group_id,
-        # generated up front so it can be passed into _apply_transaction
-        # consistently for both legs (rather than setting it via attribute
-        # assignment after the fact on just one side, which would be easy
-        # to get out of sync with future changes to this method).
-        is_mirrored_transfer = bool(
-            related_account and data.type in TRANSFER_MIRROR
-        )
+        is_mirrored_transfer = bool(related_account and data.type in TRANSFER_MIRROR)
         is_cross_currency = bool(
             related_account and str(account.currency) != str(related_account.currency)
         )
 
         if is_mirrored_transfer and is_cross_currency and not data.fx_rate:
-            # Don't silently fall back to an auto-fetched rate here. The
-            # user controls the FX rate explicitly (see fx_service.py /
-            # the "Set FX Rate" UI) and a cross-currency transfer is exactly
-            # the moment that rate has real, immediate financial effect —
-            # require it on the request rather than letting a stale or
-            # live-fetched number get baked into the converted leg without
-            # the user seeing or choosing it.
             raise HTTPException(
                 status_code=422,
                 detail=(
                     f"This transfer moves money between a {account.currency} account and a "
-                    f"{related_account.currency} account. Provide fx_rate (USD->KZT, e.g. 475.50) "
+                    f"{related_account.currency} account. Provide fx_rate (USD->KZT) "
                     f"so the converted amount is explicit."
                 ),
             )
 
         group_id = uuid.uuid4() if is_mirrored_transfer else None
 
-        tx = await BankService._apply_transaction(db, account, data, transfer_group_id=group_id)
+        # ── Handle stock buy/sell → auto-create portfolio transaction ────
+        linked_portfolio_tx_id: Optional[int] = None
+        if data.type in STOCK_TYPES:
+            linked_portfolio_tx_id = await BankService._create_portfolio_tx(
+                db, user_id, data
+            )
 
-        # Auto-create the mirrored leg for transfers between two of the
-        # user's own accounts. We don't mirror INCOME/EXPENSE/etc. — only
-        # TRANSFER_IN/TRANSFER_OUT, since those are explicitly two-sided.
+        tx = await BankService._apply_transaction(
+            db, account, data,
+            transfer_group_id=group_id,
+            linked_portfolio_tx_id=linked_portfolio_tx_id,
+        )
+
+        # Mirror the other leg of a transfer
         if is_mirrored_transfer:
             mirrored_amount = await BankService._convert_amount(
-                db, amount=data.amount, from_currency=str(account.currency.value),
-                to_currency=str(related_account.currency.value), fx_rate=data.fx_rate,
+                db, amount=data.amount,
+                from_currency=str(account.currency.value),
+                to_currency=str(related_account.currency.value),
+                fx_rate=data.fx_rate,
             )
             mirrored_data = BankTransactionCreate(
                 type=TRANSFER_MIRROR[data.type],
@@ -222,21 +203,82 @@ class BankService:
 
         await db.flush()
         await db.refresh(tx)
+        return BankTransactionResponse.model_validate(tx)
+
+    @staticmethod
+    async def _create_portfolio_tx(
+        db: AsyncSession, user_id: int, data: BankTransactionCreate,
+    ) -> int:
+        """
+        Auto-create a portfolio BUY or SELL transaction from a bank STOCK
+        transaction. Returns the id of the created portfolio transaction.
+        """
+        from app.models.portfolio import Portfolio
+
+        # Verify the portfolio belongs to this user
+        result = await db.execute(
+            select(Portfolio).where(
+                and_(Portfolio.id == data.portfolio_id, Portfolio.user_id == user_id)
+            )
+        )
+        portfolio = result.scalar_one_or_none()
+        if not portfolio:
+            raise HTTPException(status_code=404, detail="Portfolio not found")
+
+        # Resolve or create security
+        ticker = data.ticker.upper()
+        result = await db.execute(
+            select(Security).where(Security.ticker == ticker)
+        )
+        security = result.scalar_one_or_none()
+        if not security:
+            from app.services.price_service import PriceService
+            info = await PriceService.get_security_info(ticker)
+            if not info:
+                raise HTTPException(status_code=422, detail=f"Ticker '{ticker}' not found")
+            security = Security(**info)
+            db.add(security)
+            await db.flush()
+            await db.refresh(security)
+
+        fx_rate = data.fx_rate or await FxService.get_rate(db, data.date)
+        price_usd = data.price_per_share
+        price_kzt = price_usd * fx_rate
+        total_usd = price_usd * data.quantity
+        total_kzt = price_kzt * data.quantity
+
+        tx_type = TransactionType.BUY if data.type == BankTransactionType.STOCK_BUY else TransactionType.SELL
+
+        tx = Transaction(
+            portfolio_id=data.portfolio_id,
+            security_id=security.id,
+            type=tx_type,
+            date=data.date,
+            quantity=data.quantity,
+            price_usd=price_usd,
+            price_kzt=price_kzt,
+            total_usd=total_usd,
+            total_kzt=total_kzt,
+            fx_rate_usd_kzt=fx_rate,
+            notes=data.notes,
+        )
+        db.add(tx)
+        await db.flush()
+
+        # Update the position
+        from app.services.portfolio_service import PortfolioService
+        await PortfolioService._update_position(db, data.portfolio_id, security, tx, fx_rate)
 
         logger.info(
-            "Bank transaction added",
+            "Auto-created portfolio tx from bank tx",
             extra={
-                "account_id": account_id,
-                "tx_id": tx.id,
-                "type": data.type,
-                "amount": float(data.amount),
-                "currency": account.currency,
-                "mirrored": is_mirrored_transfer,
-                "cross_currency": is_cross_currency,
-                "fx_rate_used": float(data.fx_rate) if data.fx_rate else None,
+                "portfolio_id": data.portfolio_id,
+                "ticker": ticker,
+                "type": tx_type,
+                "portfolio_tx_id": tx.id,
             },
         )
-        return BankTransactionResponse.model_validate(tx)
+        return tx.id
 
     @staticmethod
     async def _convert_amount(
@@ -246,32 +288,17 @@ class BankService:
         to_currency: str,
         fx_rate: Optional[Decimal],
     ) -> Decimal:
-        """
-        Convert a (positive-magnitude) amount from one account currency to
-        another. Same currency -> no-op. Different currency -> use the
-        supplied fx_rate if present, otherwise fetch the current USD/KZT
-        rate. fx_rate is always expressed as USD->KZT regardless of
-        direction, matching the convention used everywhere else in this
-        codebase (Transaction.fx_rate_usd_kzt, FxRate.usd_to_kzt).
-        """
         if from_currency == to_currency:
             return amount
-
         rate = fx_rate if fx_rate else await FxService.get_rate(db)
-
         if from_currency == "USD" and to_currency == "KZT":
             return amount * rate
         if from_currency == "KZT" and to_currency == "USD":
             return amount / rate
-
-        # Only USD/KZT accounts exist today (AccountCurrency enum), so this
-        # branch should be unreachable — but fail loudly instead of silently
-        # mis-converting if that ever changes.
         raise HTTPException(
             status_code=422,
-            detail=f"Unsupported currency pair for transfer: {from_currency} -> {to_currency}",
+            detail=f"Unsupported currency pair: {from_currency} -> {to_currency}",
         )
-
 
     @staticmethod
     async def _apply_transaction(
@@ -279,21 +306,10 @@ class BankService:
         account: BankAccount,
         data: BankTransactionCreate,
         transfer_group_id: Optional[uuid.UUID] = None,
+        linked_portfolio_tx_id: Optional[int] = None,
     ) -> BankTransaction:
-        """
-        Core balance-update + row-insert logic, shared by both legs of a
-        transfer. Raises if the resulting balance would go negative.
-        """
         new_balance = account.balance + data.amount
         if new_balance < 0:
-            logger.warning(
-                "Insufficient balance for transaction",
-                extra={
-                    "account_id": account.id,
-                    "current_balance": float(account.balance),
-                    "transaction_amount": float(data.amount),
-                },
-            )
             raise HTTPException(
                 status_code=422,
                 detail=f"Insufficient balance on account '{account.name}': {account.balance}",
@@ -310,10 +326,18 @@ class BankService:
             fx_rate=data.fx_rate,
             notes=data.notes,
             transfer_group_id=transfer_group_id,
+            # Stock link fields
+            ticker=data.ticker,
+            quantity=data.quantity,
+            price_per_share=data.price_per_share,
+            portfolio_id=data.portfolio_id,
+            linked_portfolio_tx_id=linked_portfolio_tx_id,
         )
         db.add(tx)
         await db.flush()
         return tx
+
+    # ── Delete transaction ────────────────────────────────────────────────────
 
     @staticmethod
     async def delete_transaction(
@@ -322,11 +346,10 @@ class BankService:
         """
         Delete a bank transaction and reverse its balance effect.
 
-        If the transaction is one leg of an auto-created transfer pair (it
-        has a related_account_id and type TRANSFER_IN/TRANSFER_OUT), the
-        mirrored leg on the other account is found and deleted too, with its
-        balance effect reversed as well — otherwise deleting one side would
-        leave the books unbalanced.
+        For STOCK_BUY/STOCK_SELL: also deletes the linked portfolio
+        transaction and reverses the position.
+
+        For transfer pairs: deletes the mirrored leg too.
         """
         account = await BankService.get_account_or_404(db, user_id, account_id)
 
@@ -339,17 +362,13 @@ class BankService:
         if not tx:
             raise HTTPException(status_code=404, detail="Transaction not found")
 
-        # Find the mirrored leg, if any. Primary match is transfer_group_id
-        # — exact and unambiguous, including for cross-currency transfers
-        # where the two legs' amounts differ (one side is converted via
-        # fx_rate, so amount can't be used for matching).
-        #
-        # Fallback: rows created before this column existed (or any
-        # legacy/manually-entered transfer pairs) have transfer_group_id =
-        # NULL, so for those we fall back to the old heuristic — same
-        # type-pair, same date, pointing back at this account — on a
-        # best-effort basis. New transfers created by add_transaction
-        # always get a group id and never hit this branch.
+        # ── Delete linked portfolio transaction ───────────────────────────
+        if tx.type in STOCK_TYPES and tx.linked_portfolio_tx_id:
+            await BankService._delete_linked_portfolio_tx(
+                db, user_id, tx.linked_portfolio_tx_id, tx.portfolio_id
+            )
+
+        # ── Delete transfer mirror leg ────────────────────────────────────
         mirror_tx: Optional[BankTransaction] = None
         if tx.transfer_group_id is not None:
             mirror_result = await db.execute(
@@ -380,12 +399,28 @@ class BankService:
         if mirror_tx:
             related_account = await BankService.get_account_or_404(db, user_id, tx.related_account_id)
             await BankService._reverse_and_delete(db, related_account, mirror_tx)
-            logger.info(
-                "Mirrored transfer leg deleted alongside primary transaction",
-                extra={"account_id": account_id, "primary_tx_id": transaction_id, "mirror_tx_id": mirror_tx.id},
-            )
 
         await db.flush()
+
+    @staticmethod
+    async def _delete_linked_portfolio_tx(
+        db: AsyncSession, user_id: int, portfolio_tx_id: int, portfolio_id: int
+    ) -> None:
+        """Delete the portfolio transaction created by a bank STOCK_BUY/SELL."""
+        from app.services.portfolio_service import PortfolioService
+        try:
+            await PortfolioService.delete_transaction(
+                db, user_id, portfolio_id, portfolio_tx_id
+            )
+            logger.info(
+                "Auto-deleted linked portfolio tx",
+                extra={"portfolio_tx_id": portfolio_tx_id, "portfolio_id": portfolio_id},
+            )
+        except HTTPException as e:
+            # If the portfolio tx is already gone (manual deletion), log and continue
+            logger.warning(
+                "Linked portfolio tx not found during bank tx delete: %s", e.detail
+            )
 
     @staticmethod
     async def _reverse_and_delete(db: AsyncSession, account: BankAccount, tx: BankTransaction) -> None:
@@ -395,20 +430,10 @@ class BankService:
                 status_code=422,
                 detail=f"Cannot delete: reversal would result in negative balance on '{account.name}' ({new_balance:.2f})",
             )
-
         account.balance = new_balance
-
-        logger.info(
-            "Bank transaction deleted",
-            extra={
-                "account_id": account.id,
-                "tx_id": tx.id,
-                "amount_reversed": float(tx.amount),
-                "new_balance": float(new_balance),
-            },
-        )
-
         await db.delete(tx)
+
+    # ── List transactions ─────────────────────────────────────────────────────
 
     @staticmethod
     async def list_transactions(
@@ -420,9 +445,9 @@ class BankService:
             .where(BankTransaction.account_id == account_id)
             .order_by(desc(BankTransaction.date), desc(BankTransaction.created_at))
         )
-        txs = result.scalars().all()
-        logger.debug("Listed bank transactions", extra={"account_id": account_id, "count": len(txs)})
-        return [BankTransactionResponse.model_validate(tx) for tx in txs]
+        return [BankTransactionResponse.model_validate(tx) for tx in result.scalars().all()]
+
+    # ── FX ────────────────────────────────────────────────────────────────────
 
     @staticmethod
     async def set_fx_rate(db: AsyncSession, data: FxRateCreate) -> FxRateResponse:

@@ -1,6 +1,5 @@
 from fastapi import APIRouter, Depends, File, Query, UploadFile
 from sqlalchemy.ext.asyncio import AsyncSession
-from typing import Optional
 
 from app.db.session import get_db
 from app.core.security import get_current_user_id
@@ -40,7 +39,6 @@ async def get_portfolio_summary(
     user_id: int = Depends(get_current_user_id),
     db: AsyncSession = Depends(get_db),
 ):
-    """Get full portfolio with live prices, P&L, and FX conversion."""
     return await PortfolioService.get_summary(db, user_id, portfolio_id)
 
 
@@ -50,15 +48,7 @@ async def recalculate_portfolio(
     user_id: int = Depends(get_current_user_id),
     db: AsyncSession = Depends(get_db),
 ):
-    """
-    Rebuild Holdings (positions) from the transaction history.
-
-    Wipes the cached positions for this portfolio and replays every
-    BUY/SELL/SPLIT transaction in date order to recompute quantity, average
-    cost, and total invested from scratch. Use this if Holdings looks wrong
-    after a bulk import or any other data inconsistency — the transaction
-    history is always treated as the source of truth.
-    """
+    """Rebuild positions from transaction history (use after data fixes)."""
     return await PortfolioService.recalculate_positions(db, user_id, portfolio_id)
 
 
@@ -89,6 +79,7 @@ async def list_transactions(
     user_id: int = Depends(get_current_user_id),
     db: AsyncSession = Depends(get_db),
 ):
+    """List BUY, SELL, SPLIT transactions for this portfolio."""
     return await PortfolioService.list_transactions(db, user_id, portfolio_id)
 
 
@@ -99,6 +90,10 @@ async def add_transaction(
     user_id: int = Depends(get_current_user_id),
     db: AsyncSession = Depends(get_db),
 ):
+    """
+    Add a SPLIT transaction directly.
+    BUY and SELL are created automatically via bank STOCK_BUY/STOCK_SELL transactions.
+    """
     return await PortfolioService.add_transaction(db, user_id, portfolio_id, data)
 
 
@@ -110,13 +105,12 @@ async def delete_transaction(
     db: AsyncSession = Depends(get_db),
 ):
     """
-    Delete a transaction and reverse its effect on the position.
-    BUY reversal: decreases qty + cost basis.
-    SELL reversal: restores qty + cost basis.
-    SPLIT reversal: un-multiplies shares.
-    DIVIDEND/TAX/COMMISSION: deleted with no position change.
+    Delete a portfolio transaction and reverse its position effect.
+    Note: BUY/SELL transactions are normally deleted by deleting their linked
+    bank transaction. This endpoint handles direct deletions and SPLIT removals.
     """
     await PortfolioService.delete_transaction(db, user_id, portfolio_id, transaction_id)
+
 
 @router.post("/{portfolio_id}/transactions/import", response_model=TransactionImportResult, status_code=201)
 async def import_transactions(
@@ -126,16 +120,18 @@ async def import_transactions(
     db: AsyncSession = Depends(get_db),
 ):
     """
-    Bulk-import transactions from CSV or Excel (.xlsx).
+    Bulk-import SPLIT transactions from CSV or Excel.
 
     Required columns: ticker, type, date, quantity, price_usd
-    Optional columns: fx_rate_usd_kzt, commission_usd, split_ratio, notes
+    Optional columns: fx_rate_usd_kzt, split_ratio, notes
 
-    type ∈ BUY, SELL, DIVIDEND, TAX, SPLIT, COMMISSION
-    date formats: YYYY-MM-DD, DD.MM.YYYY, DD/MM/YYYY, MM/DD/YYYY
+    type ∈ BUY, SELL, SPLIT
+    Note: BUY/SELL imported here bypass bank account balance updates.
+    Use bank transaction import for stock purchases/sales that affect cash.
     """
     content = await file.read()
     return await ImportService.import_transactions(db, user_id, portfolio_id, content, file.filename)
+
 
 # ── Securities ────────────────────────────────────────────────────────────────
 
@@ -155,7 +151,5 @@ async def lookup_and_add_security(
     _: int = Depends(get_current_user_id),
 ):
     """Fetch security info from Yahoo Finance and store it."""
-    from app.services.portfolio_service import PortfolioService
     sec = await PortfolioService.get_or_create_security(db, ticker)
-    from app.schemas.portfolio import SecurityResponse
     return SecurityResponse.model_validate(sec)

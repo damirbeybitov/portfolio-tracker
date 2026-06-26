@@ -6,8 +6,9 @@ import { ApiService } from '../../core/services/api.service';
 import { Transaction, TransactionType } from '../../core/models';
 
 const TX_BADGES: Record<TransactionType, string> = {
-  BUY: 'badge-green', SELL: 'badge-red', DIVIDEND: 'badge-blue',
-  TAX: 'badge-amber', SPLIT: 'badge-muted', COMMISSION: 'badge-muted'
+  BUY: 'badge-green',
+  SELL: 'badge-red',
+  SPLIT: 'badge-muted',
 };
 
 interface ImportRowResult {
@@ -52,16 +53,21 @@ interface ImportResult {
         </div>
       </div>
 
-      <!-- Import template hint -->
+      <!-- Import hint -->
       <div class="import-hint card" style="margin-bottom:20px; padding:14px 20px;">
         <div class="hint-row">
-          <svg width="15" height="15" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24" style="flex-shrink:0; margin-top:2px; color:var(--text-muted)">
+          <svg width="15" height="15" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24" style="flex-shrink:0;margin-top:2px;color:var(--text-muted)">
             <circle cx="12" cy="12" r="10"/><line x1="12" y1="16" x2="12" y2="12"/><line x1="12" y1="8" x2="12.01" y2="8"/>
           </svg>
           <div>
-            <strong>Columns required:</strong> ticker, type, date, quantity, price_usd.
-            <strong>Optional:</strong> fx_rate_usd_kzt, commission_usd, split_ratio, notes.
-            <span class="text-muted">type ∈ BUY / SELL / DIVIDEND / TAX / SPLIT / COMMISSION. Date: YYYY-MM-DD, DD.MM.YYYY, DD/MM/YYYY, or MM/DD/YYYY.</span>
+            This history shows <strong>BUY, SELL, and SPLIT</strong> only.
+            Dividends, taxes, commissions, and transfers are in <strong>Bank Accounts</strong>.
+            <br>
+            <span class="text-muted">
+              Import columns required: ticker, type, date, quantity, price_usd.
+              Optional: fx_rate_usd_kzt, split_ratio, notes.
+              type ∈ BUY / SELL / SPLIT. Date: YYYY-MM-DD, DD.MM.YYYY.
+            </span>
           </div>
         </div>
       </div>
@@ -80,9 +86,7 @@ interface ImportResult {
               </span>
               <span>
                 Imported <strong>{{ importResult()!.imported }}</strong> of <strong>{{ importResult()!.total }}</strong> rows
-                @if (importResult()!.failed > 0) {
-                  — <strong class="text-red">{{ importResult()!.failed }} failed</strong>
-                }
+                @if (importResult()!.failed > 0) { — <strong class="text-red">{{ importResult()!.failed }} failed</strong> }
               </span>
             </div>
             <button class="btn btn-ghost btn-sm" (click)="importResult.set(null)">✕</button>
@@ -111,13 +115,10 @@ interface ImportResult {
             <option value="">All Types</option>
             <option value="BUY">Buy</option>
             <option value="SELL">Sell</option>
-            <option value="DIVIDEND">Dividend</option>
-            <option value="TAX">Tax</option>
             <option value="SPLIT">Split</option>
-            <option value="COMMISSION">Commission</option>
           </select>
-          <input type="date" class="form-control" style="width:auto" [(ngModel)]="filterFrom" (change)="applyFilters()" placeholder="From">
-          <input type="date" class="form-control" style="width:auto" [(ngModel)]="filterTo" (change)="applyFilters()" placeholder="To">
+          <input type="date" class="form-control" style="width:auto" [(ngModel)]="filterFrom" (change)="applyFilters()">
+          <input type="date" class="form-control" style="width:auto" [(ngModel)]="filterTo" (change)="applyFilters()">
           @if (filterText || filterType || filterFrom || filterTo) {
             <button class="btn btn-ghost btn-sm" (click)="clearFilters()">Clear filters</button>
           }
@@ -132,7 +133,9 @@ interface ImportResult {
             <div class="empty-state">
               <div class="empty-icon">📋</div>
               <div class="empty-title">No transactions</div>
-              <div class="empty-desc">Transactions will appear here once you add them</div>
+              <div class="empty-desc">
+                Buy or sell shares via Bank Accounts to see transactions here
+              </div>
             </div>
           } @else {
             <table class="data-table">
@@ -146,7 +149,7 @@ interface ImportResult {
                   <th class="num-col">Total (USD)</th>
                   <th class="num-col">Total (KZT)</th>
                   <th class="num-col">FX Rate</th>
-                  <th class="num-col">Commission</th>
+                  <th class="num-col">Split ×</th>
                   <th>Notes</th>
                   <th></th>
                 </tr>
@@ -155,9 +158,7 @@ interface ImportResult {
                 @for (tx of filtered(); track tx.id) {
                   <tr [class.deleting]="deletingId() === tx.id">
                     <td class="date-cell num">{{ tx.date | date:'dd MMM yyyy' }}</td>
-                    <td>
-                      <span class="badge" [class]="getBadge(tx.type)">{{ tx.type }}</span>
-                    </td>
+                    <td><span class="badge" [class]="getBadge(tx.type)">{{ tx.type }}</span></td>
                     <td>
                       <div class="security-info">
                         <span class="ticker">{{ tx.security.ticker }}</span>
@@ -165,36 +166,42 @@ interface ImportResult {
                       </div>
                     </td>
                     <td class="num-col num">{{ tx.quantity | number:'1.0-4' }}</td>
-                    <td class="num-col num">{{ tx.price_usd | currency:'USD':'symbol':'1.2-4' }}</td>
-                    <td class="num-col num" [class.profit]="tx.type==='SELL'" [class.loss]="tx.type==='BUY'">
-                      {{ tx.type === 'SELL' ? '+' : (tx.type === 'BUY' ? '-' : '') }}{{ tx.total_usd | currency:'USD':'symbol':'1.2-2' }}
-                    </td>
-                    <td class="num-col num">₸ {{ tx.total_kzt | number:'1.0-0' }}</td>
-                    <td class="num-col num text-secondary">{{ tx.fx_rate_usd_kzt | number:'1.2-2' }}</td>
                     <td class="num-col num">
-                      @if (+tx.commission_usd > 0) {
-                        <span class="text-secondary">{{ tx.commission_usd | currency:'USD':'symbol':'1.2-2' }}</span>
+                      @if (tx.type !== 'SPLIT') {
+                        {{ tx.price_usd | currency:'USD':'symbol':'1.2-4' }}
+                      } @else { <span class="text-muted">—</span> }
+                    </td>
+                    <td class="num-col num" [class.profit]="tx.type==='SELL'" [class.loss]="tx.type==='BUY'">
+                      @if (tx.type !== 'SPLIT') {
+                        {{ tx.type === 'SELL' ? '+' : '-' }}{{ tx.total_usd | currency:'USD':'symbol':'1.2-2' }}
+                      } @else { <span class="text-muted">—</span> }
+                    </td>
+                    <td class="num-col num">
+                      @if (tx.type !== 'SPLIT') { ₸ {{ tx.total_kzt | number:'1.0-0' }}
+                      } @else { <span class="text-muted">—</span> }
+                    </td>
+                    <td class="num-col num text-secondary">
+                      @if (tx.type !== 'SPLIT') { {{ tx.fx_rate_usd_kzt | number:'1.2-2' }}
+                      } @else { <span class="text-muted">—</span> }
+                    </td>
+                    <td class="num-col num">
+                      @if (tx.split_ratio) {
+                        <span class="badge badge-muted">×{{ tx.split_ratio }}</span>
                       } @else { — }
                     </td>
                     <td class="notes-cell">
-                      @if (tx.notes) {
-                        <span class="note-text" [title]="tx.notes">{{ tx.notes }}</span>
-                      }
+                      @if (tx.notes) { <span class="note-text" [title]="tx.notes">{{ tx.notes }}</span> }
                     </td>
                     <td class="action-cell">
-                      <button
-                        class="btn-delete"
+                      <button class="btn-delete"
                         [class.confirming]="confirmDeleteId() === tx.id"
                         [disabled]="deletingId() === tx.id"
                         (click)="onDeleteClick(tx)"
-                        [title]="confirmDeleteId() === tx.id ? 'Click again to confirm deletion' : 'Delete transaction'"
-                      >
+                        [title]="tx.type !== 'SPLIT' ? 'Delete portfolio tx only (bank tx remains)' : 'Delete split'">
                         @if (deletingId() === tx.id) {
                           <div class="spinner" style="width:14px;height:14px;border-width:2px"></div>
                         } @else if (confirmDeleteId() === tx.id) {
-                          <svg width="14" height="14" fill="none" stroke="currentColor" stroke-width="2.5" viewBox="0 0 24 24">
-                            <polyline points="20 6 9 17 4 12"/>
-                          </svg>
+                          <svg width="14" height="14" fill="none" stroke="currentColor" stroke-width="2.5" viewBox="0 0 24 24"><polyline points="20 6 9 17 4 12"/></svg>
                           <span>Confirm</span>
                         } @else {
                           <svg width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24">
@@ -214,25 +221,25 @@ interface ImportResult {
             <!-- Totals row -->
             <div class="totals-bar">
               <span class="tot-label">Total Invested:</span>
-              <span class="tot-value num">{{ totals().invested | currency:'USD':'symbol':'1.2-2' }}</span>
+              <span class="tot-value num loss">{{ totals().invested | currency:'USD':'symbol':'1.2-2' }}</span>
               <span class="tot-sep">|</span>
               <span class="tot-label">Total Proceeds:</span>
               <span class="tot-value num profit">{{ totals().proceeds | currency:'USD':'symbol':'1.2-2' }}</span>
               <span class="tot-sep">|</span>
-              <span class="tot-label">Commissions:</span>
-              <span class="tot-value num loss">{{ totals().commissions | currency:'USD':'symbol':'1.2-2' }}</span>
+              <span class="tot-label">Net:</span>
+              <span class="tot-value num"
+                [class.profit]="totals().net >= 0"
+                [class.loss]="totals().net < 0">
+                {{ totals().net >= 0 ? '+' : '' }}{{ totals().net | currency:'USD':'symbol':'1.2-2' }}
+              </span>
             </div>
           }
         </div>
       }
     </div>
 
-    <!-- Delete error toast -->
     @if (deleteError()) {
       <div class="toast toast-error">
-        <svg width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24">
-          <circle cx="12" cy="12" r="10"/><line x1="12" y1="8" x2="12" y2="12"/><line x1="12" y1="16" x2="12.01" y2="16"/>
-        </svg>
         {{ deleteError() }}
         <button class="toast-close" (click)="deleteError.set('')">✕</button>
       </div>
@@ -249,69 +256,28 @@ interface ImportResult {
     .tot-label { font-size: 12px; color: var(--text-muted); text-transform: uppercase; letter-spacing: 0.5px; }
     .tot-value { font-size: 14px; font-weight: 600; }
     .tot-sep { color: var(--border-active); }
-
-    /* Import hint */
     .import-hint { font-size: 12px; color: var(--text-secondary); }
     .hint-row { display: flex; gap: 10px; align-items: flex-start; line-height: 1.6; }
-
-    /* Import result banner */
     .import-result { padding: 0; overflow: hidden; }
-    .import-result-header {
-      display: flex; align-items: center; justify-content: space-between;
-      padding: 14px 20px; font-size: 13px;
-    }
+    .import-result-header { display: flex; align-items: center; justify-content: space-between; padding: 14px 20px; font-size: 13px; }
     .import-result.has-errors .import-result-header { border-bottom: 1px solid var(--border); }
     .ir-summary { display: flex; align-items: center; gap: 10px; }
-    .ir-badge {
-      display: flex; align-items: center; justify-content: center;
-      width: 22px; height: 22px; border-radius: 50%; flex-shrink: 0;
-      &.ok { background: var(--green-dim); color: var(--green); }
-      &.warn { background: var(--amber-dim); color: var(--amber); }
-    }
+    .ir-badge { display: flex; align-items: center; justify-content: center; width: 22px; height: 22px; border-radius: 50%; flex-shrink: 0; &.ok { background: var(--green-dim); color: var(--green); } &.warn { background: var(--amber-dim); color: var(--amber); } }
     .ir-errors { padding: 4px 20px 16px; display: flex; flex-direction: column; gap: 6px; max-height: 220px; overflow-y: auto; }
     .ir-error-row { display: flex; gap: 10px; font-size: 12px; }
     .ir-row-num { color: var(--text-muted); font-family: var(--font-mono); flex-shrink: 0; min-width: 56px; }
     .ir-error-text { color: var(--red); }
-
-    /* Row deleting state */
     tr.deleting td { opacity: 0.4; transition: opacity 0.2s; }
-
-    /* Delete button */
-    .action-cell { width: 80px; text-align: right; padding-right: 12px !important; }
-    .btn-delete {
-      display: inline-flex; align-items: center; gap: 5px;
-      padding: 4px 9px; border-radius: var(--radius-sm);
-      font-size: 11px; font-weight: 600;
-      border: 1px solid transparent; cursor: pointer;
-      background: transparent; color: var(--text-muted);
-      transition: all var(--transition); white-space: nowrap;
-      &:hover:not(:disabled):not(.confirming) {
-        background: var(--red-dim); color: var(--red);
-        border-color: rgba(248,113,113,0.25);
-      }
-      &.confirming {
-        background: var(--red-dim); color: var(--red);
-        border-color: rgba(248,113,113,0.4);
-        animation: pulse-border 1s ease-in-out infinite;
-      }
+    .action-cell { width: 90px; text-align: right; padding-right: 12px !important; }
+    .btn-delete { display: inline-flex; align-items: center; gap: 5px; padding: 4px 9px; border-radius: var(--radius-sm); font-size: 11px; font-weight: 600; border: 1px solid transparent; cursor: pointer; background: transparent; color: var(--text-muted); transition: all var(--transition); white-space: nowrap;
+      &:hover:not(:disabled):not(.confirming) { background: var(--red-dim); color: var(--red); border-color: rgba(248,113,113,0.25); }
+      &.confirming { background: var(--red-dim); color: var(--red); border-color: rgba(248,113,113,0.4); animation: pulse-border 1s ease-in-out infinite; }
       &:disabled { opacity: 0.5; cursor: not-allowed; }
     }
-    @keyframes pulse-border {
-      0%, 100% { border-color: rgba(248,113,113,0.4); }
-      50% { border-color: rgba(248,113,113,0.8); }
-    }
-
-    /* Toast */
-    .toast {
-      position: fixed; bottom: 24px; right: 24px; z-index: 9999;
-      display: flex; align-items: center; gap: 10px;
-      padding: 12px 16px; border-radius: var(--radius);
-      font-size: 13px; font-weight: 500;
-      box-shadow: var(--shadow-elevated);
-      animation: slideIn 0.2s ease;
-    }
+    @keyframes pulse-border { 0%, 100% { border-color: rgba(248,113,113,0.4); } 50% { border-color: rgba(248,113,113,0.8); } }
+    .toast { position: fixed; bottom: 24px; right: 24px; z-index: 9999; display: flex; align-items: center; gap: 10px; padding: 12px 16px; border-radius: var(--radius); font-size: 13px; font-weight: 500; box-shadow: var(--shadow-elevated); animation: slideIn 0.2s ease; }
     .toast-error { background: var(--bg-elevated); border: 1px solid rgba(248,113,113,0.4); color: var(--red); }
-    .toast-close { background: none; border: none; cursor: pointer; color: inherit; opacity: 0.7; padding: 0; margin-left: 4px; font-size: 14px; &:hover { opacity: 1; } }
+    .toast-close { background: none; border: none; cursor: pointer; color: inherit; opacity: 0.7; padding: 0; margin-left: 4px; font-size: 14px; }
     @keyframes slideIn { from { opacity: 0; transform: translateY(8px); } to { opacity: 1; transform: translateY(0); } }
   `]
 })
@@ -326,13 +292,12 @@ export class TransactionsComponent implements OnInit {
   filterType = '';
   filterFrom = '';
   filterTo = '';
-  totals = signal({ invested: 0, proceeds: 0, commissions: 0 });
+  totals = signal({ invested: 0, proceeds: 0, net: 0 });
   deletingId = signal<number | null>(null);
   confirmDeleteId = signal<number | null>(null);
   deleteError = signal('');
   private confirmTimer: ReturnType<typeof setTimeout> | null = null;
 
-  // Import state
   importing = signal(false);
   importResult = signal<ImportResult | null>(null);
   failedRows = () => (this.importResult()?.results || []).filter(r => r.status === 'error');
@@ -347,12 +312,8 @@ export class TransactionsComponent implements OnInit {
   loadTransactions(): void {
     this.loading.set(true);
     this.api.listTransactions(this.portfolioId).subscribe({
-      next: (txs) => {
-        this.transactions.set(txs);
-        this.applyFilters();
-        this.loading.set(false);
-      },
-      error: () => this.loading.set(false)
+      next: txs => { this.transactions.set(txs); this.applyFilters(); this.loading.set(false); },
+      error: () => this.loading.set(false),
     });
   }
 
@@ -360,7 +321,9 @@ export class TransactionsComponent implements OnInit {
     let result = this.transactions();
     if (this.filterText) {
       const q = this.filterText.toLowerCase();
-      result = result.filter(t => t.security.ticker.toLowerCase().includes(q) || t.security.name.toLowerCase().includes(q));
+      result = result.filter(t =>
+        t.security.ticker.toLowerCase().includes(q) || t.security.name.toLowerCase().includes(q)
+      );
     }
     if (this.filterType) result = result.filter(t => t.type === this.filterType);
     if (this.filterFrom) result = result.filter(t => t.date >= this.filterFrom);
@@ -370,13 +333,12 @@ export class TransactionsComponent implements OnInit {
   }
 
   calcTotals(txs: Transaction[]): void {
-    let invested = 0, proceeds = 0, commissions = 0;
+    let invested = 0, proceeds = 0;
     txs.forEach(t => {
       if (t.type === 'BUY') invested += +t.total_usd;
       if (t.type === 'SELL') proceeds += +t.total_usd;
-      commissions += +t.commission_usd;
     });
-    this.totals.set({ invested, proceeds, commissions });
+    this.totals.set({ invested, proceeds, net: proceeds - invested });
   }
 
   clearFilters(): void {
@@ -388,18 +350,13 @@ export class TransactionsComponent implements OnInit {
 
   onDeleteClick(tx: Transaction): void {
     if (this.confirmDeleteId() === tx.id) {
-      // Second click — confirmed, proceed with deletion
       if (this.confirmTimer) clearTimeout(this.confirmTimer);
       this.confirmDeleteId.set(null);
       this.executeDelete(tx.id);
     } else {
-      // First click — ask for confirmation
       if (this.confirmTimer) clearTimeout(this.confirmTimer);
       this.confirmDeleteId.set(tx.id);
-      // Auto-cancel confirmation after 3 seconds
-      this.confirmTimer = setTimeout(() => {
-        this.confirmDeleteId.set(null);
-      }, 3000);
+      this.confirmTimer = setTimeout(() => this.confirmDeleteId.set(null), 3000);
     }
   }
 
@@ -412,16 +369,13 @@ export class TransactionsComponent implements OnInit {
         this.applyFilters();
         this.deletingId.set(null);
       },
-      error: (e) => {
+      error: e => {
         this.deleteError.set(e.error?.detail || 'Failed to delete transaction.');
         this.deletingId.set(null);
-        // Auto-dismiss error after 5s
         setTimeout(() => this.deleteError.set(''), 5000);
-      }
+      },
     });
   }
-
-  // ── Import ────────────────────────────────────────────────────────────
 
   openImportPicker(): void {
     if (this.importing()) return;
@@ -433,26 +387,20 @@ export class TransactionsComponent implements OnInit {
     const input = event.target as HTMLInputElement;
     const file = input.files?.[0];
     if (!file) return;
-
     this.importing.set(true);
     this.importResult.set(null);
-    this.deleteError.set('');
-
     this.api.importTransactions(this.portfolioId, file).subscribe({
       next: (res: ImportResult) => {
-        this.importResult.set(res);
-        this.importing.set(false);
+        this.importResult.set(res); this.importing.set(false);
         this.loadTransactions();
       },
-      error: (e) => {
+      error: e => {
         this.importing.set(false);
         this.importResult.set({
-          total: 0,
-          imported: 0,
-          failed: 1,
-          results: [{ row: 0, status: 'error', error: e.error?.detail || 'Import failed. Check file format.' }]
+          total: 0, imported: 0, failed: 1,
+          results: [{ row: 0, status: 'error', error: e.error?.detail || 'Import failed.' }]
         });
-      }
+      },
     });
   }
 }

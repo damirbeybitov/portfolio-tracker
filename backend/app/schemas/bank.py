@@ -1,4 +1,4 @@
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
 from datetime import datetime, date
 from decimal import Decimal
 from typing import Optional
@@ -54,11 +54,30 @@ class BankTransactionCreate(BaseModel):
     related_account_id: Optional[int] = None
     fx_rate: Optional[Decimal] = None
     notes: Optional[str] = None
-    # transfer_group_id is intentionally NOT here — it's generated
-    # server-side in BankService.add_transaction and shared between the
-    # two auto-created legs of a transfer. Accepting it from the client
-    # would let a caller forge/collide group ids and corrupt the pairing
-    # used by delete_transaction.
+
+    # Stock link — required when type is STOCK_BUY or STOCK_SELL
+    ticker: Optional[str] = Field(None, max_length=20)
+    quantity: Optional[Decimal] = Field(None, gt=0)
+    price_per_share: Optional[Decimal] = Field(None, gt=0)
+    portfolio_id: Optional[int] = None
+
+    @model_validator(mode="after")
+    def validate_stock_fields(self) -> "BankTransactionCreate":
+        if self.type in (BankTransactionType.STOCK_BUY, BankTransactionType.STOCK_SELL):
+            missing = []
+            if not self.ticker:
+                missing.append("ticker")
+            if self.quantity is None:
+                missing.append("quantity")
+            if self.price_per_share is None:
+                missing.append("price_per_share")
+            if self.portfolio_id is None:
+                missing.append("portfolio_id")
+            if missing:
+                raise ValueError(
+                    f"Fields required for {self.type}: {', '.join(missing)}"
+                )
+        return self
 
 
 class BankTransactionResponse(BaseModel):
@@ -72,6 +91,14 @@ class BankTransactionResponse(BaseModel):
     fx_rate: Optional[Decimal]
     notes: Optional[str]
     transfer_group_id: Optional[UUID] = None
+
+    # Stock link fields
+    ticker: Optional[str] = None
+    quantity: Optional[Decimal] = None
+    price_per_share: Optional[Decimal] = None
+    portfolio_id: Optional[int] = None
+    linked_portfolio_tx_id: Optional[int] = None
+
     created_at: datetime
     model_config = {"from_attributes": True}
 
@@ -87,6 +114,7 @@ class FxRateResponse(BaseModel):
     usd_to_kzt: Decimal
     source: str
     model_config = {"from_attributes": True}
+
 
 class BankTransactionImportRow(BaseModel):
     row: int

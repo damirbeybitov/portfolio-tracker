@@ -1,10 +1,10 @@
 import { Component, OnInit, signal } from '@angular/core';
-import { CommonModule, DecimalPipe, CurrencyPipe } from '@angular/common';
+import { CommonModule } from '@angular/common';
 import { RouterLink, ActivatedRoute, Router } from '@angular/router';
 import { FormsModule } from '@angular/forms';
 import { ApiService } from '../../core/services/api.service';
 import { PortfolioStoreService } from '../../core/services/portfolio-store.service';
-import { PortfolioSummary, Position, Security, TransactionCreate, TransactionType } from '../../core/models';
+import { PortfolioSummary, Position, Security, TransactionCreate } from '../../core/models';
 
 @Component({
   selector: 'app-portfolio',
@@ -18,9 +18,7 @@ import { PortfolioSummary, Position, Security, TransactionCreate, TransactionTyp
           <h1 class="page-title">{{ summary()?.portfolio?.name || 'Portfolio' }}</h1>
           <p class="page-subtitle">
             {{ summary()?.positions?.length || 0 }} positions
-            @if (summary()?.fx_rate) {
-              · FX {{ summary()!.fx_rate | number:'1.2-2' }} KZT/USD
-            }
+            @if (summary()?.fx_rate) { · FX {{ summary()!.fx_rate | number:'1.2-2' }} KZT/USD }
           </p>
         </div>
         <div class="flex gap-2 flex-wrap">
@@ -38,25 +36,20 @@ import { PortfolioSummary, Position, Security, TransactionCreate, TransactionTyp
             </svg>
             Analytics
           </a>
-          <button class="btn btn-primary" (click)="openAddTx('BUY')">
+          <button class="btn btn-primary" (click)="openSplitModal()">
             <svg width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24">
               <line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/>
             </svg>
-            Add Transaction
+            Add Split
           </button>
-          <button
-            class="btn-delete-portfolio-detail"
+          <button class="btn-delete-portfolio-detail"
             [class.confirming]="confirmDeletePortfolio()"
             [disabled]="deletingPortfolio()"
-            (click)="onDeletePortfolioClick()"
-            [title]="confirmDeletePortfolio() ? 'Click again to confirm — this also deletes all transactions and positions' : 'Delete this portfolio'"
-          >
+            (click)="onDeletePortfolioClick()">
             @if (deletingPortfolio()) {
               <span class="spinner" style="width:13px;height:13px;border-width:2px"></span>
             } @else if (confirmDeletePortfolio()) {
-              <svg width="13" height="13" fill="none" stroke="currentColor" stroke-width="2.5" viewBox="0 0 24 24">
-                <polyline points="20 6 9 17 4 12"/>
-              </svg>
+              <svg width="13" height="13" fill="none" stroke="currentColor" stroke-width="2.5" viewBox="0 0 24 24"><polyline points="20 6 9 17 4 12"/></svg>
               <span>Confirm Delete</span>
             } @else {
               <svg width="13" height="13" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24">
@@ -115,24 +108,34 @@ import { PortfolioSummary, Position, Security, TransactionCreate, TransactionTyp
           </div>
         </div>
 
+        <!-- Info banner -->
+        <div class="info-banner" style="margin-bottom:20px">
+          <svg width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24" style="flex-shrink:0;margin-top:1px">
+            <circle cx="12" cy="12" r="10"/><line x1="12" y1="16" x2="12" y2="12"/><line x1="12" y1="8" x2="12.01" y2="8"/>
+          </svg>
+          <span>
+            To buy or sell shares go to
+            <strong>Bank Accounts → + Transaction → Stock Buy / Stock Sell</strong>.
+            Your cash account is debited and the trade is recorded here automatically.
+            Use <strong>Add Split</strong> on this page only for stock splits.
+          </span>
+        </div>
+
         <!-- Holdings table -->
         <div class="card">
           <div class="card-header">
             <h2>Holdings</h2>
-            <div class="flex gap-2 items-center">
+            <div class="flex gap-2 items-center flex-wrap">
               @if (recalcMessage()) {
                 <span class="recalc-msg" [class.recalc-error]="recalcError()">{{ recalcMessage() }}</span>
               }
-              <button
-                class="btn btn-ghost btn-sm"
+              <button class="btn btn-ghost btn-sm"
                 [class.recalc-confirming]="confirmRecalc()"
                 [disabled]="recalcLoading()"
                 (click)="onRecalculateClick()"
-                title="Rebuild Holdings from the full transaction history. Use this if positions look wrong after an import or data edit."
-              >
+                title="Rebuild Holdings from transaction history">
                 @if (recalcLoading()) {
-                  <span class="spinner" style="width:13px;height:13px;border-width:2px"></span>
-                  Recalculating...
+                  <span class="spinner" style="width:13px;height:13px;border-width:2px"></span> Recalculating...
                 } @else if (confirmRecalc()) {
                   <svg width="13" height="13" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><polyline points="20 6 9 17 4 12"/></svg>
                   Confirm rebuild
@@ -140,13 +143,9 @@ import { PortfolioSummary, Position, Security, TransactionCreate, TransactionTyp
                   <svg width="13" height="13" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24">
                     <polyline points="23 4 23 10 17 10"/><path d="M20.49 15a9 9 0 1 1-2.12-9.36L23 10"/>
                   </svg>
-                  Recalculate Holdings
+                  Recalculate
                 }
               </button>
-              <button class="btn btn-ghost btn-sm" (click)="openAddTx('SPLIT')">Split</button>
-              <button class="btn btn-ghost btn-sm" (click)="openAddTx('DIVIDEND')">Dividend</button>
-              <button class="btn btn-ghost btn-sm" (click)="openAddTx('TAX')">Tax</button>
-              <button class="btn btn-ghost btn-sm" (click)="openAddTx('COMMISSION')">Commission</button>
             </div>
           </div>
 
@@ -154,8 +153,10 @@ import { PortfolioSummary, Position, Security, TransactionCreate, TransactionTyp
             <div class="empty-state">
               <div class="empty-icon">📈</div>
               <div class="empty-title">No positions yet</div>
-              <div class="empty-desc">Add your first buy transaction to start tracking</div>
-              <button class="btn btn-primary mt-4" (click)="openAddTx('BUY')">Record First Buy</button>
+              <div class="empty-desc">
+                Go to Bank Accounts and add a <strong>Stock Buy</strong> transaction to record your first purchase
+              </div>
+              <a routerLink="/bank" class="btn btn-primary mt-4">Go to Bank Accounts</a>
             </div>
           } @else {
             <table class="data-table">
@@ -187,17 +188,13 @@ import { PortfolioSummary, Position, Security, TransactionCreate, TransactionTyp
                       @if (pos.current_price_usd) {
                         <div>{{ pos.current_price_usd | currency:'USD':'symbol':'1.2-2' }}</div>
                         <div class="sub-val">₸ {{ pos.current_price_kzt | number:'1.0-0' }}</div>
-                      } @else {
-                        <span class="text-muted">—</span>
-                      }
+                      } @else { <span class="text-muted">—</span> }
                     </td>
                     <td class="num-col num">
                       @if (pos.current_value_usd) {
                         <div>{{ pos.current_value_usd | currency:'USD':'symbol':'1.2-2' }}</div>
                         <div class="sub-val">₸ {{ pos.current_value_kzt | number:'1.0-0' }}</div>
-                      } @else {
-                        <span class="text-muted">—</span>
-                      }
+                      } @else { <span class="text-muted">—</span> }
                     </td>
                     <td class="num-col num" [class.profit]="(pos.profit_usd||0) >= 0" [class.loss]="(pos.profit_usd||0) < 0">
                       @if (pos.profit_usd != null) {
@@ -213,19 +210,14 @@ import { PortfolioSummary, Position, Security, TransactionCreate, TransactionTyp
                     </td>
                     <td class="num-col">
                       <div class="weight-wrap">
-                        <div class="weight-track">
-                          <div class="weight-fill" [style.width.%]="getWeight(pos)"></div>
-                        </div>
+                        <div class="weight-track"><div class="weight-fill" [style.width.%]="getWeight(pos)"></div></div>
                         <span class="num" style="font-size:11px;color:var(--text-muted);min-width:32px;text-align:right">
                           {{ getWeight(pos) | number:'1.0-0' }}%
                         </span>
                       </div>
                     </td>
                     <td>
-                      <div class="row-acts">
-                        <button class="btn btn-ghost btn-sm" (click)="openAddTx('BUY', pos.security)">Buy</button>
-                        <button class="btn btn-ghost btn-sm loss-btn" (click)="openAddTx('SELL', pos.security)">Sell</button>
-                      </div>
+                      <button class="btn btn-ghost btn-sm" (click)="openSplitModal(pos.security)">Split</button>
                     </td>
                   </tr>
                 }
@@ -236,169 +228,81 @@ import { PortfolioSummary, Position, Security, TransactionCreate, TransactionTyp
       }
     </div>
 
-    <!-- Add Transaction Modal -->
-    @if (showTxModal) {
-      <div class="modal-backdrop" (click)="showTxModal = false">
-        <div class="modal modal-lg" (click)="$event.stopPropagation()">
+    <!-- Split Modal -->
+    @if (showSplitModal) {
+      <div class="modal-backdrop" (click)="showSplitModal = false">
+        <div class="modal" (click)="$event.stopPropagation()">
           <div class="modal-header">
             <div>
-              <h3>Add Transaction</h3>
-              <div class="tx-type-pills">
-                @for (t of txTypes; track t.value) {
-                  <button class="type-pill" [class.active]="tx.type === t.value"
-                    (click)="tx.type = t.value">{{ t.label }}</button>
-                }
-              </div>
+              <h3>Record Stock Split</h3>
+              <p style="font-size:12px;color:var(--text-secondary);margin-top:4px">
+                Adjusts share count and average cost. Does not affect your bank balance.
+              </p>
             </div>
-            <button class="btn btn-ghost btn-sm" (click)="showTxModal = false">✕</button>
+            <button class="btn btn-ghost btn-sm" (click)="showSplitModal = false">✕</button>
           </div>
           <div class="modal-body">
             @if (txError) { <div class="alert alert-error">{{ txError }}</div> }
-
-            <div class="tx-grid">
-              <!-- Security search -->
-              <div class="form-group tx-security" [class.full-span]="true">
-                <label>Security</label>
-                @if (!tx.security_id) {
-                  <div class="search-wrap">
-                    <input type="text" class="form-control" [(ngModel)]="tickerSearch"
-                      (input)="searchSecurities()" placeholder="Search ticker or name (AAPL, MSFT...)"
-                      autofocus>
-                    @if (searchResults().length > 0) {
-                      <div class="search-dropdown">
-                        @for (s of searchResults(); track s.id) {
-                          <div class="search-row" (click)="selectSecurity(s)">
-                            <span class="badge badge-muted mono">{{ s.ticker }}</span>
-                            <span class="sr-name">{{ s.name }}</span>
-                            @if (s.exchange) { <span class="sr-exch">{{ s.exchange }}</span> }
-                          </div>
-                        }
-                        <div class="search-row search-lookup" (click)="lookupTicker()">
-                          @if (lookupLoading) {
-                            <div class="spinner" style="width:14px;height:14px;border-width:2px"></div>
-                            <span>Looking up "{{ tickerSearch }}"...</span>
-                          } @else {
-                            <svg width="13" height="13" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><circle cx="11" cy="11" r="8"/><line x1="21" y1="21" x2="16.65" y2="16.65"/></svg>
-                            <span>Lookup "{{ tickerSearch.toUpperCase() }}" from Yahoo Finance</span>
-                          }
+            <div class="form-group">
+              <label>Security</label>
+              @if (!tx.security_id) {
+                <div class="search-wrap">
+                  <input type="text" class="form-control" [(ngModel)]="tickerSearch"
+                    (input)="searchSecurities()" placeholder="Search ticker..." autofocus>
+                  @if (searchResults().length > 0) {
+                    <div class="search-dropdown">
+                      @for (s of searchResults(); track s.id) {
+                        <div class="search-row" (click)="selectSecurity(s)">
+                          <span class="badge badge-muted mono">{{ s.ticker }}</span>
+                          <span class="sr-name">{{ s.name }}</span>
                         </div>
-                      </div>
-                    } @else if (tickerSearch.length > 0 && !searchLoading) {
-                      <div class="search-dropdown">
-                        <div class="search-row search-lookup" (click)="lookupTicker()">
-                          @if (lookupLoading) {
-                            <div class="spinner" style="width:14px;height:14px;border-width:2px"></div>
-                            <span>Looking up "{{ tickerSearch }}"...</span>
-                          } @else {
-                            <svg width="13" height="13" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><circle cx="11" cy="11" r="8"/><line x1="21" y1="21" x2="16.65" y2="16.65"/></svg>
-                            <span>Lookup "{{ tickerSearch.toUpperCase() }}" from Yahoo Finance</span>
-                          }
-                        </div>
-                      </div>
-                    }
-                  </div>
-                } @else {
-                  <div class="selected-sec">
-                    <span class="badge badge-accent mono">{{ selectedSecurity?.ticker }}</span>
-                    <span class="sel-name">{{ selectedSecurity?.name }}</span>
-                    @if (selectedSecurity?.exchange) {
-                      <span class="sel-exch badge badge-muted">{{ selectedSecurity?.exchange }}</span>
-                    }
-                    <button class="btn btn-ghost btn-sm" (click)="clearSecurity()" style="margin-left:auto">Change</button>
-                  </div>
-                }
-              </div>
-
-              <!-- Date -->
-              <div class="form-group">
-                <label>Date</label>
-                <input type="date" class="form-control" [(ngModel)]="tx.date">
-              </div>
-
-              @if (tx.type !== 'SPLIT') {
-                <!-- Quantity -->
-                <div class="form-group">
-                  <label>{{ tx.type === 'DIVIDEND' || tx.type === 'TAX' || tx.type === 'COMMISSION' ? 'Amount (USD)' : 'Quantity' }}</label>
-                  <input type="number" class="form-control" [(ngModel)]="tx.quantity" min="0" step="0.0001"
-                    [placeholder]="tx.type === 'DIVIDEND' || tx.type === 'TAX' || tx.type === 'COMMISSION' ? '0.00' : '10'">
+                      }
+                    </div>
+                  }
                 </div>
-
-                @if (tx.type !== 'DIVIDEND' && tx.type !== 'TAX' && tx.type !== 'COMMISSION') {
-                  <!-- Price -->
-                  <div class="form-group">
-                    <label>Price per share (USD)</label>
-                    <input type="number" class="form-control" [(ngModel)]="tx.price_usd" min="0" step="0.01" placeholder="0.00">
-                  </div>
-
-                  <!-- Commission -->
-                  <div class="form-group">
-                    <label>Commission (USD)</label>
-                    <input type="number" class="form-control" [(ngModel)]="tx.commission_usd" min="0" step="0.01" placeholder="0.00">
-                  </div>
-                }
-
-                <!-- FX Rate -->
-                <div class="form-group">
-                  <label>FX Rate USD/KZT <span class="label-hint">(auto if blank)</span></label>
-                  <input type="number" class="form-control" [(ngModel)]="tx.fx_rate_usd_kzt" min="0" step="0.01"
-                    [placeholder]="'auto (~' + (summary()?.fx_rate || 475) + ')'">
+              } @else {
+                <div class="selected-sec">
+                  <span class="badge badge-accent mono">{{ selectedSecurity?.ticker }}</span>
+                  <span>{{ selectedSecurity?.name }}</span>
+                  <button class="btn btn-ghost btn-sm" (click)="clearSecurity()" style="margin-left:auto">Change</button>
                 </div>
               }
-
-              @if (tx.type === 'SPLIT') {
-                <div class="form-group">
-                  <label>Split Ratio <span class="label-hint">e.g. 2 for 2-for-1</span></label>
-                  <input type="number" class="form-control" [(ngModel)]="tx.split_ratio" min="0.01" step="0.01" placeholder="2">
-                </div>
-              }
-
-              <!-- Notes -->
-              <div class="form-group tx-notes">
-                <label>Notes (optional)</label>
-                <input type="text" class="form-control" [(ngModel)]="tx.notes" placeholder="e.g. Quarterly dividend">
-              </div>
             </div>
-
-            <!-- Transaction preview -->
-            @if (txPreview(); as p) {
+            <div class="form-group">
+              <label>Date</label>
+              <input type="date" class="form-control" [(ngModel)]="tx.date">
+            </div>
+            <div class="form-group">
+              <label>Split Ratio <span style="color:var(--text-muted);font-weight:400;font-size:11px">e.g. 4 for a 4-for-1 split</span></label>
+              <input type="number" class="form-control" [(ngModel)]="tx.split_ratio" min="0.01" step="0.01" placeholder="4">
+            </div>
+            @if (tx.split_ratio && +tx.split_ratio > 0) {
               <div class="tx-preview-box">
                 <div class="preview-row">
-                  <span>{{ tx.type === 'SELL' ? 'Proceeds' : 'Total Cost' }}</span>
-                  <span class="num" [class.profit]="tx.type === 'SELL'" [class.loss]="tx.type === 'BUY'">
-                    {{ tx.type === 'SELL' ? '+' : '' }}{{ p.totalUsd | currency:'USD':'symbol':'1.2-2' }}
+                  <span style="color:var(--text-muted)">Effect</span>
+                  <span style="font-size:13px;color:var(--text-secondary)">
+                    Shares × {{ tx.split_ratio }}, avg cost ÷ {{ tx.split_ratio }}
                   </span>
-                </div>
-                @if (p.commissionUsd > 0) {
-                  <div class="preview-row">
-                    <span>Commission</span>
-                    <span class="num loss">-{{ p.commissionUsd | currency:'USD':'symbol':'1.2-2' }}</span>
-                  </div>
-                }
-                <div class="preview-row preview-total">
-                  <span>In KZT</span>
-                  <span class="num">₸ {{ p.totalKzt | number:'1.0-0' }}</span>
                 </div>
               </div>
             }
+            <div class="form-group">
+              <label>Notes (optional)</label>
+              <input type="text" class="form-control" [(ngModel)]="tx.notes" placeholder="e.g. NVIDIA 10:1 split">
+            </div>
           </div>
           <div class="modal-footer">
-            <button class="btn btn-secondary" (click)="showTxModal = false">Cancel</button>
-            <button class="btn btn-primary" (click)="submitTransaction()" [disabled]="txLoading">
-              @if (txLoading) { <span class="spinner"></span> } @else {
-                {{ tx.type === 'BUY' ? 'Record Buy' : tx.type === 'SELL' ? 'Record Sell' : 'Record Transaction' }}
-              }
+            <button class="btn btn-secondary" (click)="showSplitModal = false">Cancel</button>
+            <button class="btn btn-primary" (click)="submitSplit()" [disabled]="txLoading">
+              @if (txLoading) { <span class="spinner"></span> } @else { Record Split }
             </button>
           </div>
         </div>
       </div>
     }
 
-    <!-- Delete portfolio error toast -->
     @if (deletePortfolioError()) {
       <div class="toast toast-error">
-        <svg width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24">
-          <circle cx="12" cy="12" r="10"/><line x1="12" y1="8" x2="12" y2="12"/><line x1="12" y1="16" x2="12.01" y2="16"/>
-        </svg>
         {{ deletePortfolioError() }}
         <button class="toast-close" (click)="deletePortfolioError.set('')">✕</button>
       </div>
@@ -406,8 +310,7 @@ import { PortfolioSummary, Position, Security, TransactionCreate, TransactionTyp
   `,
   styles: [`
     .back-link { font-size: 13px; color: var(--text-secondary); text-decoration: none; display: block; margin-bottom: 6px; &:hover { color: var(--accent); } }
-
-    /* Summary strip */
+    .info-banner { display: flex; align-items: flex-start; gap: 10px; padding: 12px 16px; border-radius: var(--radius-sm); background: var(--bg-elevated); border: 1px solid var(--border); font-size: 12px; color: var(--text-secondary); line-height: 1.6; strong { color: var(--text-primary); } }
     .summary-strip { display: flex; align-items: center; padding: 20px 28px; gap: 0; flex-wrap: wrap; }
     .strip-item { display: flex; flex-direction: column; gap: 4px; padding: 0 24px; &:first-child { padding-left: 0; } }
     .strip-label { font-size: 11px; text-transform: uppercase; letter-spacing: 0.5px; color: var(--text-muted); }
@@ -415,146 +318,52 @@ import { PortfolioSummary, Position, Security, TransactionCreate, TransactionTyp
     .strip-sub { font-size: 12px; color: var(--text-secondary); }
     .strip-divider { width: 1px; height: 40px; background: var(--border); margin: 0 4px; flex-shrink: 0; }
     .strip-actions { margin-left: auto; }
-
-    /* Card header */
     .card-header { display: flex; align-items: center; justify-content: space-between; padding: 18px 20px; border-bottom: 1px solid var(--border); h2 { font-family: var(--font-display); font-size: 15px; } flex-wrap: wrap; gap: 10px; }
-
-    /* Recalculate button + message */
-    .recalc-msg {
-      font-size: 12px;
-      color: var(--green);
-      white-space: nowrap;
-      &.recalc-error { color: var(--red); }
-    }
-    .recalc-confirming {
-      background: var(--amber-dim) !important;
-      color: var(--amber) !important;
-      border-color: rgba(251,191,36,0.4) !important;
-      animation: pulse-border-amber 1s ease-in-out infinite;
-    }
-    @keyframes pulse-border-amber {
-      0%, 100% { border-color: rgba(251,191,36,0.4); }
-      50% { border-color: rgba(251,191,36,0.8); }
-    }
-
-    /* Delete portfolio (header) */
-    .btn-delete-portfolio-detail {
-      display: inline-flex; align-items: center; gap: 6px;
-      padding: 8px 16px; border-radius: var(--radius-sm);
-      font-size: 13px; font-weight: 500;
-      border: 1px solid rgba(248,113,113,0.2); cursor: pointer;
-      background: var(--red-dim); color: var(--red);
-      transition: all var(--transition); white-space: nowrap;
-      &:hover:not(:disabled):not(.confirming) {
-        background: rgba(248,113,113,0.2);
-        border-color: rgba(248,113,113,0.35);
-      }
-      &.confirming {
-        background: rgba(248,113,113,0.25);
-        border-color: rgba(248,113,113,0.5);
-        animation: pulse-border-red 1s ease-in-out infinite;
-      }
-      &:disabled { opacity: 0.6; cursor: not-allowed; }
-    }
-    @keyframes pulse-border-red {
-      0%, 100% { border-color: rgba(248,113,113,0.5); }
-      50% { border-color: rgba(248,113,113,0.9); }
-    }
-
-    /* Table */
+    .recalc-msg { font-size: 12px; color: var(--green); white-space: nowrap; &.recalc-error { color: var(--red); } }
+    .recalc-confirming { background: var(--amber-dim) !important; color: var(--amber) !important; border-color: rgba(251,191,36,0.4) !important; }
+    .btn-delete-portfolio-detail { display: inline-flex; align-items: center; gap: 6px; padding: 8px 16px; border-radius: var(--radius-sm); font-size: 13px; font-weight: 500; border: 1px solid rgba(248,113,113,0.2); cursor: pointer; background: var(--red-dim); color: var(--red); transition: all var(--transition); white-space: nowrap; &:hover:not(:disabled):not(.confirming) { background: rgba(248,113,113,0.2); } &.confirming { background: rgba(248,113,113,0.25); border-color: rgba(248,113,113,0.5); animation: pulse-border-red 1s ease-in-out infinite; } &:disabled { opacity: 0.6; cursor: not-allowed; } }
+    @keyframes pulse-border-red { 0%, 100% { border-color: rgba(248,113,113,0.5); } 50% { border-color: rgba(248,113,113,0.9); } }
     .num-col { text-align: right; }
     .sec-cell { .sec-ticker { font-family: var(--font-mono); font-weight: 700; font-size: 14px; } .sec-name { font-size: 11px; color: var(--text-muted); margin-top: 2px; max-width: 180px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; } }
     .sub-val { font-size: 11px; color: var(--text-secondary); margin-top: 2px; }
-    .pct-pill { display: inline-flex; padding: 2px 8px; border-radius: 20px; font-size: 11px; font-weight: 600; font-family: var(--font-mono);
-      &.profit { background: var(--green-dim); color: var(--green); }
-      &.loss { background: var(--red-dim); color: var(--red); }
-    }
+    .pct-pill { display: inline-flex; padding: 2px 8px; border-radius: 20px; font-size: 11px; font-weight: 600; font-family: var(--font-mono); &.profit { background: var(--green-dim); color: var(--green); } &.loss { background: var(--red-dim); color: var(--red); } }
     .weight-wrap { display: flex; align-items: center; gap: 8px; justify-content: flex-end; }
     .weight-track { width: 48px; height: 4px; background: var(--bg-base); border-radius: 2px; overflow: hidden; }
     .weight-fill { height: 100%; background: var(--accent); border-radius: 2px; }
-    .row-acts { display: flex; gap: 4px; justify-content: flex-end; }
-    .loss-btn { &:hover { color: var(--red); background: var(--red-dim); } }
-
-    /* Transaction modal */
-    .modal-lg { max-width: 620px; }
-    .tx-type-pills { display: flex; gap: 6px; flex-wrap: wrap; margin-top: 10px; }
-    .type-pill {
-      padding: 4px 12px; border-radius: 20px; font-size: 12px; font-weight: 600;
-      border: 1px solid var(--border); background: transparent; cursor: pointer;
-      color: var(--text-secondary); transition: all var(--transition);
-      &:hover { border-color: var(--border-active); color: var(--text-primary); }
-      &.active { background: var(--accent); color: var(--text-inverse); border-color: var(--accent); }
-    }
-
-    .tx-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; }
-    .full-span { grid-column: 1 / -1; }
-    .tx-notes { grid-column: 1 / -1; }
-
-    /* Security search */
     .search-wrap { position: relative; }
-    .search-dropdown {
-      position: absolute; top: calc(100% + 4px); left: 0; right: 0;
-      background: var(--bg-elevated); border: 1px solid var(--border-active);
-      border-radius: var(--radius); z-index: 200;
-      max-height: 220px; overflow-y: auto;
-      box-shadow: var(--shadow-elevated);
-    }
-    .search-row {
-      display: flex; align-items: center; gap: 10px; padding: 10px 14px;
-      cursor: pointer; font-size: 13px; transition: background var(--transition);
-      &:hover { background: var(--bg-overlay); }
-    }
-    .search-lookup { color: var(--accent); font-size: 12px; border-top: 1px solid var(--border); }
+    .search-dropdown { position: absolute; top: calc(100% + 4px); left: 0; right: 0; background: var(--bg-elevated); border: 1px solid var(--border-active); border-radius: var(--radius); z-index: 200; max-height: 220px; overflow-y: auto; box-shadow: var(--shadow-elevated); }
+    .search-row { display: flex; align-items: center; gap: 10px; padding: 10px 14px; cursor: pointer; font-size: 13px; transition: background var(--transition); &:hover { background: var(--bg-overlay); } }
     .sr-name { color: var(--text-secondary); flex: 1; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
-    .sr-exch { font-size: 11px; color: var(--text-muted); margin-left: auto; }
     .selected-sec { display: flex; align-items: center; gap: 10px; padding: 10px 14px; background: var(--bg-base); border: 1px solid var(--border); border-radius: var(--radius-sm); }
-    .sel-name { font-size: 13px; }
-    .sel-exch { font-size: 11px; }
-    .label-hint { font-size: 10px; color: var(--text-muted); font-weight: 400; text-transform: none; letter-spacing: 0; }
-
-    /* Preview box */
-    .tx-preview-box {
-      background: var(--bg-base); border: 1px solid var(--border); border-radius: var(--radius-sm);
-      padding: 14px 16px; display: flex; flex-direction: column; gap: 8px;
-    }
-    .preview-row { display: flex; align-items: center; justify-content: space-between; font-size: 13px; color: var(--text-secondary); .num { font-size: 15px; color: var(--text-primary); font-weight: 600; } }
-    .preview-total { padding-top: 8px; border-top: 1px solid var(--border); }
-
-    /* Toast */
-    .toast {
-      position: fixed; bottom: 24px; right: 24px; z-index: 9999;
-      display: flex; align-items: center; gap: 10px;
-      padding: 12px 16px; border-radius: var(--radius);
-      font-size: 13px; font-weight: 500;
-      box-shadow: var(--shadow-elevated);
-      animation: slideIn 0.2s ease;
-    }
+    .tx-preview-box { background: var(--bg-base); border: 1px solid var(--border); border-radius: var(--radius-sm); padding: 14px 16px; }
+    .preview-row { display: flex; align-items: center; justify-content: space-between; font-size: 13px; }
+    .toast { position: fixed; bottom: 24px; right: 24px; z-index: 9999; display: flex; align-items: center; gap: 10px; padding: 12px 16px; border-radius: var(--radius); font-size: 13px; font-weight: 500; box-shadow: var(--shadow-elevated); animation: slideIn 0.2s ease; }
     .toast-error { background: var(--bg-elevated); border: 1px solid rgba(248,113,113,0.4); color: var(--red); }
-    .toast-close { background: none; border: none; cursor: pointer; color: inherit; opacity: 0.7; padding: 0; margin-left: 4px; font-size: 14px; &:hover { opacity: 1; } }
+    .toast-close { background: none; border: none; cursor: pointer; color: inherit; opacity: 0.7; padding: 0; margin-left: 4px; font-size: 14px; }
     @keyframes slideIn { from { opacity: 0; transform: translateY(8px); } to { opacity: 1; transform: translateY(0); } }
-
-    @media (max-width: 900px) {
-      .summary-strip { gap: 16px; }
-      .strip-divider { display: none; }
-      .strip-item { padding: 0; }
-    }
+    @media (max-width: 900px) { .summary-strip { gap: 16px; } .strip-divider { display: none; } .strip-item { padding: 0; } }
   `]
 })
 export class PortfolioComponent implements OnInit {
   portfolioId!: number;
   loading = signal(true);
   summary = signal<PortfolioSummary | null>(null);
-  showTxModal = false;
+
+  showSplitModal = false;
   txLoading = false;
   txError = '';
   tickerSearch = '';
   searchResults = signal<Security[]>([]);
   selectedSecurity: Security | null = null;
-  lookupLoading = false;
-  searchLoading = false;
   private searchTimeout: ReturnType<typeof setTimeout> | null = null;
 
-  // Recalculate Holdings
+  tx: Partial<TransactionCreate> = {
+    type: 'SPLIT',
+    date: new Date().toISOString().split('T')[0],
+    quantity: 0,
+    price_usd: 0,
+  };
+
   recalcLoading = signal(false);
   confirmRecalc = signal(false);
   recalcMessage = signal('');
@@ -562,28 +371,10 @@ export class PortfolioComponent implements OnInit {
   private confirmRecalcTimer: ReturnType<typeof setTimeout> | null = null;
   private recalcMessageTimer: ReturnType<typeof setTimeout> | null = null;
 
-  // Delete portfolio — two-click confirm
   deletingPortfolio = signal(false);
   confirmDeletePortfolio = signal(false);
   deletePortfolioError = signal('');
   private confirmDeleteTimer: ReturnType<typeof setTimeout> | null = null;
-
-  txTypes: { value: TransactionType; label: string }[] = [
-    { value: 'BUY', label: 'Buy' },
-    { value: 'SELL', label: 'Sell' },
-    { value: 'DIVIDEND', label: 'Dividend' },
-    { value: 'TAX', label: 'Tax' },
-    { value: 'SPLIT', label: 'Split' },
-    { value: 'COMMISSION', label: 'Commission' },
-  ];
-
-  tx: Partial<TransactionCreate> & { type: TransactionType } = {
-    type: 'BUY',
-    date: new Date().toISOString().split('T')[0],
-    quantity: undefined,
-    price_usd: undefined,
-    commission_usd: 0,
-  };
 
   constructor(
     private route: ActivatedRoute,
@@ -600,92 +391,17 @@ export class PortfolioComponent implements OnInit {
   loadSummary(): void {
     this.loading.set(true);
     this.api.getPortfolioSummary(this.portfolioId).subscribe({
-      next: (s) => { this.summary.set(s); this.loading.set(false); },
+      next: s => { this.summary.set(s); this.loading.set(false); },
       error: () => this.loading.set(false),
     });
   }
 
-  onRecalculateClick(): void {
-    if (this.recalcLoading()) return;
-
-    if (this.confirmRecalc()) {
-      // Second click — confirmed, proceed
-      if (this.confirmRecalcTimer) clearTimeout(this.confirmRecalcTimer);
-      this.confirmRecalc.set(false);
-      this.executeRecalculate();
-    } else {
-      // First click — ask for confirmation since this rewrites Holdings
-      this.confirmRecalc.set(true);
-      this.confirmRecalcTimer = setTimeout(() => this.confirmRecalc.set(false), 4000);
-    }
-  }
-
-  private executeRecalculate(): void {
-    this.recalcLoading.set(true);
-    this.recalcMessage.set('');
-    if (this.recalcMessageTimer) clearTimeout(this.recalcMessageTimer);
-
-    this.api.recalculatePortfolio(this.portfolioId).subscribe({
-      next: (s) => {
-        this.summary.set(s);
-        this.recalcLoading.set(false);
-        this.recalcError.set(false);
-        this.recalcMessage.set(`Holdings rebuilt — ${s.positions.length} position${s.positions.length !== 1 ? 's' : ''} from history.`);
-        this.recalcMessageTimer = setTimeout(() => this.recalcMessage.set(''), 6000);
-      },
-      error: (e) => {
-        this.recalcLoading.set(false);
-        this.recalcError.set(true);
-        this.recalcMessage.set(e.error?.detail || 'Failed to recalculate Holdings.');
-        this.recalcMessageTimer = setTimeout(() => this.recalcMessage.set(''), 6000);
-      },
-    });
-  }
-
-  onDeletePortfolioClick(): void {
-    if (this.deletingPortfolio()) return;
-
-    if (this.confirmDeletePortfolio()) {
-      // Second click — confirmed, proceed with deletion
-      if (this.confirmDeleteTimer) clearTimeout(this.confirmDeleteTimer);
-      this.confirmDeletePortfolio.set(false);
-      this.executeDeletePortfolio();
-    } else {
-      // First click — ask for confirmation; deleting wipes every
-      // transaction and position belonging to this portfolio too
-      this.confirmDeletePortfolio.set(true);
-      this.confirmDeleteTimer = setTimeout(() => this.confirmDeletePortfolio.set(false), 4000);
-    }
-  }
-
-  private executeDeletePortfolio(): void {
-    this.deletingPortfolio.set(true);
-    this.deletePortfolioError.set('');
-    this.api.deletePortfolio(this.portfolioId).subscribe({
-      next: () => {
-        this.portfolioStore.remove(this.portfolioId);
-        this.router.navigate(['/']);
-      },
-      error: (e) => {
-        this.deletingPortfolio.set(false);
-        this.deletePortfolioError.set(e.error?.detail || 'Failed to delete portfolio.');
-        setTimeout(() => this.deletePortfolioError.set(''), 5000);
-      },
-    });
-  }
-
-  openAddTx(type: TransactionType, security?: Security): void {
-    this.tx = {
-      type,
-      date: new Date().toISOString().split('T')[0],
-      quantity: undefined,
-      price_usd: undefined,
-      commission_usd: 0,
-    };
+  openSplitModal(security?: Security): void {
+    this.tx = { type: 'SPLIT', date: new Date().toISOString().split('T')[0], quantity: 0, price_usd: 0 };
     this.txError = '';
-    if (security) this.selectSecurity(security);
-    else this.clearSecurity();
-    this.showTxModal = true;
+    if (security) { this.selectedSecurity = security; this.tx.security_id = security.id; this.tickerSearch = security.ticker; }
+    else { this.clearSecurity(); }
+    this.showSplitModal = true;
   }
 
   searchSecurities(): void {
@@ -693,80 +409,84 @@ export class PortfolioComponent implements OnInit {
     const q = this.tickerSearch.trim();
     if (q.length < 1) { this.searchResults.set([]); return; }
     this.searchTimeout = setTimeout(() => {
-      this.searchLoading = true;
-      this.api.searchSecurities(q).subscribe({
-        next: r => { this.searchResults.set(r); this.searchLoading = false; },
-        error: () => this.searchLoading = false,
-      });
+      this.api.searchSecurities(q).subscribe({ next: r => this.searchResults.set(r), error: () => {} });
     }, 250);
   }
 
   selectSecurity(s: Security): void {
-    this.selectedSecurity = s;
-    this.tx.security_id = s.id;
-    this.tickerSearch = s.ticker;
-    this.searchResults.set([]);
+    this.selectedSecurity = s; this.tx.security_id = s.id;
+    this.tickerSearch = s.ticker; this.searchResults.set([]);
   }
 
   clearSecurity(): void {
-    this.selectedSecurity = null;
-    this.tx.security_id = undefined;
-    this.tickerSearch = '';
-    this.searchResults.set([]);
+    this.selectedSecurity = null; this.tx.security_id = undefined;
+    this.tickerSearch = ''; this.searchResults.set([]);
   }
 
-  lookupTicker(): void {
-    const ticker = this.tickerSearch.trim().toUpperCase();
-    if (!ticker) return;
-    this.lookupLoading = true;
-    this.api.lookupSecurity(ticker).subscribe({
-      next: (s) => { this.selectSecurity(s); this.lookupLoading = false; },
-      error: (e) => {
-        this.txError = e.error?.detail || `Ticker "${ticker}" not found on Yahoo Finance.`;
-        this.lookupLoading = false;
-      },
-    });
-  }
-
-  txPreview(): { totalUsd: number; totalKzt: number; commissionUsd: number } | null {
-    if (this.tx.type === 'SPLIT' || !this.tx.quantity || !this.tx.price_usd) return null;
-    if (this.tx.type === 'DIVIDEND' || this.tx.type === 'TAX' || this.tx.type === 'COMMISSION') return null;
-    const fx = +(this.tx.fx_rate_usd_kzt || this.summary()?.fx_rate || 475);
-    const qty = +this.tx.quantity;
-    const price = +this.tx.price_usd;
-    const comm = +(this.tx.commission_usd || 0);
-    const totalUsd = qty * price;
-    return { totalUsd, totalKzt: totalUsd * fx, commissionUsd: comm };
-  }
-
-  submitTransaction(): void {
-    if (!this.tx.security_id) { this.txError = 'Please select a security.'; return; }
+  submitSplit(): void {
+    if (!this.tx.security_id) { this.txError = 'Select a security.'; return; }
     if (!this.tx.date) { this.txError = 'Date is required.'; return; }
-    if (this.tx.type === 'SPLIT' && !this.tx.split_ratio) { this.txError = 'Split ratio is required.'; return; }
-
+    if (!this.tx.split_ratio || +this.tx.split_ratio <= 0) { this.txError = 'Split ratio is required.'; return; }
     this.txLoading = true; this.txError = '';
     const payload: TransactionCreate = {
       security_id: this.tx.security_id!,
-      type: this.tx.type,
+      type: 'SPLIT',
       date: this.tx.date!,
-      quantity: +(this.tx.quantity || 0),
-      price_usd: +(this.tx.price_usd || 0),
-      commission_usd: +(this.tx.commission_usd || 0),
-      fx_rate_usd_kzt: this.tx.fx_rate_usd_kzt ? +this.tx.fx_rate_usd_kzt : undefined,
-      split_ratio: this.tx.split_ratio ? +this.tx.split_ratio : undefined,
+      quantity: 0,
+      price_usd: 0,
+      split_ratio: +this.tx.split_ratio,
       notes: this.tx.notes || undefined,
     };
-
     this.api.addTransaction(this.portfolioId, payload).subscribe({
-      next: () => {
-        this.showTxModal = false; this.txLoading = false;
-        this.loadSummary();
-      },
-      error: (e) => {
-        this.txError = e.error?.detail || 'Failed to record transaction.';
-        this.txLoading = false;
-      },
+      next: () => { this.showSplitModal = false; this.txLoading = false; this.loadSummary(); },
+      error: e => { this.txError = e.error?.detail || 'Failed to record split.'; this.txLoading = false; },
     });
+  }
+
+  onRecalculateClick(): void {
+    if (this.recalcLoading()) return;
+    if (this.confirmRecalc()) {
+      if (this.confirmRecalcTimer) clearTimeout(this.confirmRecalcTimer);
+      this.confirmRecalc.set(false);
+      this.recalcLoading.set(true);
+      this.recalcMessage.set('');
+      if (this.recalcMessageTimer) clearTimeout(this.recalcMessageTimer);
+      this.api.recalculatePortfolio(this.portfolioId).subscribe({
+        next: s => {
+          this.summary.set(s); this.recalcLoading.set(false); this.recalcError.set(false);
+          this.recalcMessage.set(`Rebuilt — ${s.positions.length} position${s.positions.length !== 1 ? 's' : ''}.`);
+          this.recalcMessageTimer = setTimeout(() => this.recalcMessage.set(''), 5000);
+        },
+        error: e => {
+          this.recalcLoading.set(false); this.recalcError.set(true);
+          this.recalcMessage.set(e.error?.detail || 'Failed.');
+          this.recalcMessageTimer = setTimeout(() => this.recalcMessage.set(''), 5000);
+        },
+      });
+    } else {
+      this.confirmRecalc.set(true);
+      this.confirmRecalcTimer = setTimeout(() => this.confirmRecalc.set(false), 4000);
+    }
+  }
+
+  onDeletePortfolioClick(): void {
+    if (this.deletingPortfolio()) return;
+    if (this.confirmDeletePortfolio()) {
+      if (this.confirmDeleteTimer) clearTimeout(this.confirmDeleteTimer);
+      this.confirmDeletePortfolio.set(false);
+      this.deletingPortfolio.set(true);
+      this.api.deletePortfolio(this.portfolioId).subscribe({
+        next: () => { this.portfolioStore.remove(this.portfolioId); this.router.navigate(['/']); },
+        error: e => {
+          this.deletingPortfolio.set(false);
+          this.deletePortfolioError.set(e.error?.detail || 'Failed to delete.');
+          setTimeout(() => this.deletePortfolioError.set(''), 5000);
+        },
+      });
+    } else {
+      this.confirmDeletePortfolio.set(true);
+      this.confirmDeleteTimer = setTimeout(() => this.confirmDeletePortfolio.set(false), 4000);
+    }
   }
 
   getWeight(pos: Position): number {
