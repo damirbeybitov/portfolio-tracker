@@ -2,6 +2,7 @@ import logging
 
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select, and_, delete
+from sqlalchemy.orm import load_only
 from fastapi import HTTPException, status
 from decimal import Decimal
 from datetime import date
@@ -57,13 +58,24 @@ class PortfolioService:
 
     @staticmethod
     async def delete(db: AsyncSession, user_id: int, portfolio_id: int) -> None:
+        """
+        Delete a portfolio and everything that belongs to it.
+
+        Transaction.portfolio_id and Position.portfolio_id are plain integer
+        columns (no real foreign key / ON DELETE CASCADE defined on them), so
+        Postgres will not clean those rows up on its own — deleting the
+        Portfolio row alone would leave orphaned transactions and positions
+        behind forever. Delete dependents first, then the portfolio itself.
+        """
         p = await PortfolioService.get_or_404(db, user_id, portfolio_id)
+
         await db.execute(delete(Transaction).where(Transaction.portfolio_id == portfolio_id))
         await db.execute(delete(Position).where(Position.portfolio_id == portfolio_id))
         await db.delete(p)
         await db.flush()
+
         logger.info(
-            "Portfolio deleted",
+            "Portfolio deleted (cascaded transactions + positions)",
             extra={"user_id": user_id, "portfolio_id": portfolio_id},
         )
 
@@ -113,6 +125,7 @@ class PortfolioService:
         price_kzt = data.price_usd * fx_rate
         total_usd = data.price_usd * data.quantity
         total_kzt = price_kzt * data.quantity
+        commission_kzt = data.commission_usd * fx_rate
 
         tx = Transaction(
             portfolio_id=portfolio_id,
@@ -125,6 +138,8 @@ class PortfolioService:
             total_usd=total_usd,
             total_kzt=total_kzt,
             fx_rate_usd_kzt=fx_rate,
+            commission_usd=data.commission_usd,
+            commission_kzt=commission_kzt,
             split_ratio=data.split_ratio,
             notes=data.notes,
         )
@@ -140,7 +155,7 @@ class PortfolioService:
     async def delete_transaction(
         db: AsyncSession, user_id: int, portfolio_id: int, transaction_id: int,
     ) -> None:
-        """Delete a portfolio transaction and reverse its position effect."""
+        """Delete a transaction and reverse its effect on the position."""
         await PortfolioService.get_or_404(db, user_id, portfolio_id)
 
         result = await db.execute(
@@ -165,8 +180,8 @@ class PortfolioService:
 
             if tx.type == TransactionType.BUY:
                 if pos:
-                    cost_usd = tx.price_usd * tx.quantity
-                    cost_kzt = tx.price_kzt * tx.quantity
+                    cost_usd = tx.price_usd * tx.quantity + tx.commission_usd
+                    cost_kzt = tx.price_kzt * tx.quantity + tx.commission_kzt
                     new_qty = pos.quantity - tx.quantity
                     if new_qty <= Decimal("0"):
                         await db.delete(pos)
@@ -205,6 +220,8 @@ class PortfolioService:
                     pos.avg_cost_usd = pos.avg_cost_usd * tx.split_ratio
                     pos.avg_cost_kzt = pos.avg_cost_kzt * tx.split_ratio
 
+            # DIVIDEND, TAX, COMMISSION — no position impact
+
         await db.delete(tx)
         await db.flush()
 
@@ -225,6 +242,8 @@ class PortfolioService:
             total_usd=tx.total_usd,
             total_kzt=tx.total_kzt,
             fx_rate_usd_kzt=tx.fx_rate_usd_kzt,
+            commission_usd=tx.commission_usd,
+            commission_kzt=tx.commission_kzt,
             split_ratio=tx.split_ratio,
             notes=tx.notes,
             created_at=tx.created_at,
@@ -249,18 +268,20 @@ class PortfolioService:
                     pos.avg_cost_kzt = pos.avg_cost_kzt / tx.split_ratio
             return
 
+        if tx.type in (TransactionType.DIVIDEND, TransactionType.TAX, TransactionType.COMMISSION):
+            return
+
         if tx.type == TransactionType.BUY:
-            # cost basis = price × qty (no commission — that's in bank tx)
-            cost_usd = tx.price_usd * tx.quantity
-            cost_kzt = tx.price_kzt * tx.quantity
+            cost_usd = tx.price_usd * tx.quantity + tx.commission_usd
+            cost_kzt = tx.price_kzt * tx.quantity + tx.commission_kzt
 
             if pos is None:
                 pos = Position(
                     portfolio_id=portfolio_id,
                     security_id=security.id,
                     quantity=tx.quantity,
-                    avg_cost_usd=tx.price_usd,
-                    avg_cost_kzt=tx.price_kzt,
+                    avg_cost_usd=cost_usd / tx.quantity if tx.quantity else Decimal("0"),
+                    avg_cost_kzt=cost_kzt / tx.quantity if tx.quantity else Decimal("0"),
                     total_invested_usd=cost_usd,
                     total_invested_kzt=cost_kzt,
                 )
@@ -320,6 +341,8 @@ class PortfolioService:
                 total_usd=tx.total_usd,
                 total_kzt=tx.total_kzt,
                 fx_rate_usd_kzt=tx.fx_rate_usd_kzt,
+                commission_usd=tx.commission_usd,
+                commission_kzt=tx.commission_kzt,
                 split_ratio=tx.split_ratio,
                 notes=tx.notes,
                 created_at=tx.created_at,
@@ -327,10 +350,14 @@ class PortfolioService:
             responses.append(r)
         return responses
 
-    # ── Recalculate from transaction history ──────────────────────────────────
+    # ── Recalculate positions from transaction history ──────────────────────
 
     @staticmethod
     async def recalculate_positions(db: AsyncSession, user_id: int, portfolio_id: int) -> PortfolioSummary:
+        """
+        Rebuild every position for this portfolio from scratch by replaying
+        the full transaction history in chronological order.
+        """
         await PortfolioService.get_or_404(db, user_id, portfolio_id)
 
         await db.execute(delete(Position).where(Position.portfolio_id == portfolio_id))
@@ -349,21 +376,25 @@ class PortfolioService:
             sec_result = await db.execute(select(Security).where(Security.id.in_(security_ids)))
             securities = {s.id: s for s in sec_result.scalars().all()}
 
-        skipped: list[int] = []
+        skipped_tx_ids: list[int] = []
         for tx in txs:
             security = securities.get(tx.security_id)
             if not security:
-                skipped.append(tx.id)
+                skipped_tx_ids.append(tx.id)
                 continue
             try:
                 await PortfolioService._update_position(db, portfolio_id, security, tx, tx.fx_rate_usd_kzt)
             except HTTPException:
-                skipped.append(tx.id)
+                skipped_tx_ids.append(tx.id)
+                continue
 
         await db.flush()
 
-        if skipped:
-            logger.warning("Recalculate: skipped tx ids %s", skipped)
+        if skipped_tx_ids:
+            logger.warning(
+                "Recalculate positions: skipped inconsistent transactions",
+                extra={"portfolio_id": portfolio_id, "skipped_tx_ids": skipped_tx_ids},
+            )
 
         return await PortfolioService.get_summary(db, user_id, portfolio_id)
 
@@ -379,28 +410,64 @@ class PortfolioService:
         )
         positions = result.scalars().all()
 
+        position_snapshots = [
+            {
+                "id": pos.id,
+                "portfolio_id": pos.portfolio_id,
+                "security_id": pos.security_id,
+                "quantity": pos.quantity,
+                "avg_cost_usd": pos.avg_cost_usd,
+                "avg_cost_kzt": pos.avg_cost_kzt,
+                "total_invested_usd": pos.total_invested_usd,
+                "total_invested_kzt": pos.total_invested_kzt,
+            }
+            for pos in positions
+        ]
+
         fx_rate = await FxService.get_rate(db)
 
-        security_ids = [p.security_id for p in positions]
+        security_ids = [snap["security_id"] for snap in position_snapshots]
         securities = {}
         if security_ids:
             sec_result = await db.execute(select(Security).where(Security.id.in_(security_ids)))
-            for s in sec_result.scalars().all():
+            sec_rows = sec_result.scalars().all()
+            for s in sec_rows:
                 securities[s.id] = {
-                    "id": s.id, "ticker": s.ticker, "name": s.name,
-                    "exchange": s.exchange, "currency": s.currency,
-                    "sector": s.sector, "industry": s.industry,
+                    "id": s.id,
+                    "ticker": s.ticker,
+                    "name": s.name,
+                    "exchange": s.exchange,
+                    "currency": s.currency,
+                    "sector": s.sector,
+                    "industry": s.industry,
                 }
 
-        tickers = [securities[p.security_id]["ticker"] for p in positions if p.security_id in securities]
-        prices = await PriceService.get_prices_batch(tickers) if tickers else {}
+        tickers = [
+            securities[snap["security_id"]]["ticker"]
+            for snap in position_snapshots
+            if snap["security_id"] in securities
+        ]
+
+        # Build security_map: ticker → security_id for price_history write-through
+        security_map: dict[str, int] = {
+            securities[snap["security_id"]]["ticker"]: snap["security_id"]
+            for snap in position_snapshots
+            if snap["security_id"] in securities
+        }
+
+        # Pass db + security_map so fetched prices are persisted to price_history
+        prices = (
+            await PriceService.get_prices_batch(tickers, db=db, security_map=security_map)
+            if tickers
+            else {}
+        )
 
         enriched_positions = []
         total_value_usd = Decimal("0")
         total_invested_usd = Decimal("0")
 
-        for pos in positions:
-            sec_data = securities.get(pos.security_id)
+        for snap in position_snapshots:
+            sec_data = securities.get(snap["security_id"])
             if not sec_data:
                 continue
 
@@ -408,28 +475,28 @@ class PortfolioService:
             if price_usd:
                 price_usd_dec = Decimal(str(price_usd))
                 price_kzt_dec = price_usd_dec * fx_rate
-                current_value_usd = price_usd_dec * pos.quantity
+                current_value_usd = price_usd_dec * snap["quantity"]
                 current_value_kzt = current_value_usd * fx_rate
-                profit_usd = current_value_usd - pos.total_invested_usd
+                profit_usd = current_value_usd - snap["total_invested_usd"]
                 profit_kzt = profit_usd * fx_rate
-                profit_pct = (profit_usd / pos.total_invested_usd * 100) if pos.total_invested_usd else Decimal("0")
+                profit_pct = (profit_usd / snap["total_invested_usd"] * 100) if snap["total_invested_usd"] else Decimal("0")
                 total_value_usd += current_value_usd
             else:
                 price_usd_dec = price_kzt_dec = current_value_usd = current_value_kzt = None
                 profit_usd = profit_kzt = profit_pct = None
-                total_value_usd += pos.total_invested_usd
+                total_value_usd += snap["total_invested_usd"]
 
-            total_invested_usd += pos.total_invested_usd
+            total_invested_usd += snap["total_invested_usd"]
 
             enriched_positions.append(PositionResponse(
-                id=pos.id,
-                portfolio_id=pos.portfolio_id,
+                id=snap["id"],
+                portfolio_id=snap["portfolio_id"],
                 security=SecurityResponse(**sec_data),
-                quantity=pos.quantity,
-                avg_cost_usd=pos.avg_cost_usd,
-                avg_cost_kzt=pos.avg_cost_kzt,
-                total_invested_usd=pos.total_invested_usd,
-                total_invested_kzt=pos.total_invested_kzt,
+                quantity=snap["quantity"],
+                avg_cost_usd=snap["avg_cost_usd"],
+                avg_cost_kzt=snap["avg_cost_kzt"],
+                total_invested_usd=snap["total_invested_usd"],
+                total_invested_kzt=snap["total_invested_kzt"],
                 current_price_usd=price_usd_dec,
                 current_price_kzt=price_kzt_dec,
                 current_value_usd=current_value_usd,

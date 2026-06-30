@@ -1,11 +1,13 @@
 """
 Analytics Service — portfolio P&L, bank summary, grand total.
 
-Improvements over original:
-- Period PnL tasks are isolated per-ticker (one slow ticker won't block others)
-- Historical prices are fetched as a single batch, not sequentially
-- Bank interest total uses proper transaction type filtering
-- Overall summary runs portfolio + bank fetches concurrently
+price_history write-through:
+  Every call to get_prices_batch or get_current_price now passes the db
+  session and a ticker→security_id map so live fetched prices are upserted
+  into price_history automatically — no data gap between Airflow DAG runs.
+
+Period P&L uses price_history first (fast, no external call), falls back to
+the live provider chain only when a historical row is missing.
 """
 
 from __future__ import annotations
@@ -17,7 +19,7 @@ from decimal import Decimal
 from typing import Optional
 
 from fastapi import HTTPException
-from sqlalchemy import and_, func, select
+from sqlalchemy import and_, func, select, text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.models.bank import (
@@ -106,7 +108,13 @@ class AnalyticsService:
             if p.security_id in securities
         ]
 
-        # Fetch current prices + all period historical prices concurrently
+        # security_map for price_history write-through
+        security_map: dict[str, int] = {
+            securities[p.security_id].ticker: p.security_id
+            for p in positions
+            if p.security_id in securities
+        }
+
         today = date.today()
         period_dates = {
             "1D": today - timedelta(days=1),
@@ -115,17 +123,33 @@ class AnalyticsService:
             "1Y": today - timedelta(days=365),
         }
 
-        current_prices_task = PriceService.get_prices_batch(tickers)
+        # Fetch current prices with price_history write-through
+        current_prices_task = PriceService.get_prices_batch(
+            tickers, db=db, security_map=security_map
+        )
 
         async def fetch_hist_batch(target: date) -> dict[str, Optional[float]]:
-            tasks = {
-                t: PriceService.get_historical_price(t, target) for t in tickers
-            }
-            results = await asyncio.gather(*tasks.values(), return_exceptions=True)
-            return {
-                ticker: (r if isinstance(r, float) else None)
-                for ticker, r in zip(tasks.keys(), results)
-            }
+            """
+            For each ticker resolve historical price:
+            1. price_history table (fast, free)
+            2. Provider chain fallback via get_historical_price
+            """
+            ph_prices = await AnalyticsService._prices_from_history(
+                db, security_map, target
+            )
+
+            tasks = {}
+            for t in tickers:
+                if ph_prices.get(t) is None:
+                    tasks[t] = PriceService.get_historical_price(t, target)
+
+            if tasks:
+                results = await asyncio.gather(*tasks.values(), return_exceptions=True)
+                for ticker, r in zip(tasks.keys(), results):
+                    if isinstance(r, float):
+                        ph_prices[ticker] = r
+
+            return ph_prices
 
         hist_tasks = [fetch_hist_batch(d) for d in period_dates.values()]
         all_results = await asyncio.gather(
@@ -182,7 +206,6 @@ class AnalyticsService:
             else ZERO
         )
 
-        # Build period PnL objects
         def build_pnl(period_key: str) -> PeriodPnl:
             hist = hist_by_period[period_key]
             value_start = ZERO
@@ -227,6 +250,54 @@ class AnalyticsService:
         )
 
     # ------------------------------------------------------------------ #
+    #  price_history lookup helper                                         #
+    # ------------------------------------------------------------------ #
+
+    @staticmethod
+    async def _prices_from_history(
+        db: AsyncSession,
+        security_map: dict[str, int],
+        target_date: date,
+    ) -> dict[str, Optional[float]]:
+        """
+        Batch-fetch the closest available close price on or before target_date
+        from price_history for each security in security_map.
+
+        Returns {ticker: close_price | None}.
+        """
+        if not security_map:
+            return {}
+
+        # Use DISTINCT ON to get the most recent row per security on or before
+        # target_date in a single round-trip — much cheaper than N individual
+        # queries when a portfolio has many positions.
+        sql = text(
+            """
+            SELECT DISTINCT ON (security_id)
+                security_id,
+                close
+            FROM price_history
+            WHERE security_id = ANY(:ids)
+              AND date <= :target
+            ORDER BY security_id, date DESC
+            """
+        )
+        sec_id_to_ticker = {v: k for k, v in security_map.items()}
+        result = await db.execute(
+            sql,
+            {"ids": list(security_map.values()), "target": target_date},
+        )
+        rows = result.fetchall()
+
+        prices: dict[str, Optional[float]] = {t: None for t in security_map}
+        for row in rows:
+            ticker = sec_id_to_ticker.get(row.security_id)
+            if ticker and row.close is not None:
+                prices[ticker] = float(row.close)
+
+        return prices
+
+    # ------------------------------------------------------------------ #
     #  Bank summary                                                        #
     # ------------------------------------------------------------------ #
 
@@ -250,7 +321,6 @@ class AnalyticsService:
         accounts_data = []
 
         for acc in accounts:
-            # Interest earned — sum of all INTEREST transactions
             interest_result = await db.execute(
                 select(func.sum(BankTransaction.amount)).where(
                     and_(
@@ -261,7 +331,6 @@ class AnalyticsService:
             )
             interest_earned = Decimal(str(interest_result.scalar() or 0))
 
-            # Current interest rate
             from app.services.bank_service import BankService
 
             rate = await BankService._get_current_rate(db, acc.id)
@@ -306,7 +375,6 @@ class AnalyticsService:
     async def get_overall_summary(
         db: AsyncSession, user_id: int, portfolio_id: int
     ) -> OverallSummary:
-        # Run both concurrently
         portfolio_task = AnalyticsService.get_portfolio_analytics(
             db, user_id, portfolio_id
         )

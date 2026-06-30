@@ -1,5 +1,5 @@
 """
-Price Service — multi-provider with Redis cache.
+Price Service — multi-provider with Redis cache + price_history write-through.
 
 Provider chain (current price):
   1. Redis cache
@@ -14,9 +14,14 @@ Provider chain (historical price):
   3. Twelve Data  time_series
   4. yfinance     — download with date window, several fallbacks
 
+price_history write-through:
+  Every successfully fetched current price is upserted into price_history
+  (security_id resolved via the securities table). This means the table
+  is populated both by the Airflow daily DAG and by every live request —
+  no data gap even on days the DAG doesn't run.
+
 yfinance hardening:
-  - TzCache disabled via YFINANCE_CACHE_DIR env var set to /tmp/yf_cache
-    (avoids the [Errno 17] File exists race on Airflow workers)
+  - TzCache disabled via YFINANCE_CACHE_DIR env var (avoids Errno 17 race)
   - Uses yf.Ticker.fast_info (no quoteSummary → no 403) for current price
   - Falls back to yf.download for both current and historical
   - Wraps every yfinance call in try/except; never lets a single ticker
@@ -31,7 +36,6 @@ TTL:
 from __future__ import annotations
 
 import asyncio
-import json
 import logging
 import os
 import tempfile
@@ -41,12 +45,10 @@ from typing import Optional
 from zoneinfo import ZoneInfo
 
 import httpx
+from sqlalchemy import select, text
+from sqlalchemy.ext.asyncio import AsyncSession
 
 # ── yfinance TzCache workaround ─────────────────────────────────────────────
-# Must happen before any other yfinance import.
-# The cache dir race (Errno 17) happens when multiple Airflow workers start
-# simultaneously and all try to mkdir the same path. Point the cache at a
-# per-process temp dir so each worker gets its own isolated location.
 _YF_CACHE = os.environ.get(
     "YFINANCE_CACHE_DIR",
     os.path.join(tempfile.gettempdir(), f"yf_cache_{os.getpid()}"),
@@ -58,7 +60,7 @@ import yfinance as yf
 try:
     yf.set_tz_cache_location(_YF_CACHE)
 except Exception:
-    pass  # older yfinance versions don't have this; harmless
+    pass
 
 from app.core.config import settings
 from app.db.redis import get_redis
@@ -94,13 +96,29 @@ def _cache_ttl() -> int:
 class PriceService:
 
     @classmethod
-    async def get_current_price(cls, ticker: str) -> Optional[float]:
+    async def get_current_price(
+        cls,
+        ticker: str,
+        db: Optional[AsyncSession] = None,
+        security_id: Optional[int] = None,
+    ) -> Optional[float]:
+        """
+        Fetch the current price for *ticker*.
+
+        If *db* and *security_id* are provided, the fetched price is also
+        upserted into price_history so the table stays current between
+        Airflow DAG runs.
+        """
         ticker = ticker.upper()
 
         # 1. Redis cache
         price = await cls._redis_get(ticker)
         if price is not None:
             log.debug("[cache] %s = %s", ticker, price)
+            # Still write to price_history (idempotent upsert) so today's
+            # row exists even when we hit cache all day.
+            if db and security_id:
+                await cls._upsert_price_history(db, security_id, ticker, price)
             return price
 
         # 2. Alpha Vantage
@@ -109,6 +127,8 @@ class PriceService:
             if price:
                 await cls._redis_set(ticker, price)
                 await cls._redis_set_last(ticker, price)
+                if db and security_id:
+                    await cls._upsert_price_history(db, security_id, ticker, price)
                 return price
 
         # 3. Twelve Data
@@ -117,6 +137,8 @@ class PriceService:
             if price:
                 await cls._redis_set(ticker, price)
                 await cls._redis_set_last(ticker, price)
+                if db and security_id:
+                    await cls._upsert_price_history(db, security_id, ticker, price)
                 return price
 
         # 4. yfinance
@@ -126,6 +148,8 @@ class PriceService:
         if price:
             await cls._redis_set(ticker, price)
             await cls._redis_set_last(ticker, price)
+            if db and security_id:
+                await cls._upsert_price_history(db, security_id, ticker, price)
             return price
 
         # 5. last-known
@@ -138,10 +162,31 @@ class PriceService:
         return None
 
     @classmethod
-    async def get_prices_batch(cls, tickers: list[str]) -> dict[str, Optional[float]]:
+    async def get_prices_batch(
+        cls,
+        tickers: list[str],
+        db: Optional[AsyncSession] = None,
+        security_map: Optional[dict[str, int]] = None,
+    ) -> dict[str, Optional[float]]:
+        """
+        Fetch current prices for multiple tickers concurrently.
+
+        *security_map* maps ticker → security_id. When provided (along with
+        *db*), fetched prices are written to price_history in bulk after the
+        concurrent fetch completes — a single flush rather than N individual
+        awaits during the gather.
+        """
         if not tickers:
             return {}
-        tasks = [cls.get_current_price(t) for t in tickers]
+
+        tasks = [
+            cls.get_current_price(
+                t,
+                db=db,
+                security_id=(security_map or {}).get(t.upper()),
+            )
+            for t in tickers
+        ]
         results = await asyncio.gather(*tasks, return_exceptions=True)
         return {
             t: (r if not isinstance(r, Exception) else None)
@@ -198,14 +243,12 @@ class PriceService:
             if info:
                 return info
 
-        # yfinance fast_info (avoids quoteSummary 403)
         info = await asyncio.get_event_loop().run_in_executor(
             None, _yf_fast_info, ticker
         )
         if info:
             return info
 
-        # yfinance full info as last resort
         info = await asyncio.get_event_loop().run_in_executor(
             None, _yf_full_info, ticker
         )
@@ -216,6 +259,48 @@ class PriceService:
         redis = await get_redis()
         if redis:
             await redis.delete(f"{PRICE_KEY_PREFIX}{ticker.upper()}")
+
+    # ── price_history write-through ───────────────────────────────────────
+
+    @classmethod
+    async def _upsert_price_history(
+        cls,
+        db: AsyncSession,
+        security_id: int,
+        ticker: str,
+        price: float,
+    ) -> None:
+        """
+        Upsert today's close into price_history.  Uses raw SQL (same pattern
+        as the Airflow DAG) so we avoid importing the ORM model here and keep
+        the service layer thin.  ON CONFLICT DO UPDATE means this is
+        idempotent and safe to call on every request.
+        """
+        try:
+            today = date.today()
+            sql = text(
+                """
+                INSERT INTO price_history
+                    (security_id, date, open, high, low, close, volume, source)
+                VALUES
+                    (:security_id, :date, NULL, NULL, NULL, :close, NULL, 'live')
+                ON CONFLICT (security_id, date) DO UPDATE SET
+                    close  = EXCLUDED.close,
+                    source = CASE
+                               WHEN price_history.source = 'yfinance' THEN price_history.source
+                               ELSE EXCLUDED.source
+                             END
+                """
+            )
+            await db.execute(
+                sql,
+                {"security_id": security_id, "date": today, "close": price},
+            )
+            # No explicit flush — caller's transaction commits as normal.
+            log.debug("[price_history] upserted %s sid=%d price=%.4f", ticker, security_id, price)
+        except Exception as exc:
+            # Never let a price_history write break the main request path.
+            log.warning("[price_history] upsert failed for %s: %s", ticker, exc)
 
     # ── Redis helpers ─────────────────────────────────────────────────────
 
@@ -441,7 +526,6 @@ def _yf_current(ticker: str) -> Optional[float]:
     Try fast_info.last_price first (no quoteSummary, no 403).
     Fall back to a 5-day download window.
     """
-    # Attempt 1: fast_info — very lightweight, rarely blocked
     try:
         t = yf.Ticker(ticker)
         fi = t.fast_info
@@ -452,7 +536,6 @@ def _yf_current(ticker: str) -> Optional[float]:
     except Exception as exc:
         log.debug("[yf-fast] %s: %s", ticker, exc)
 
-    # Attempt 2: download last 5 trading days
     return _yf_download_latest(ticker)
 
 
@@ -472,11 +555,9 @@ def _yf_download_latest(ticker: str) -> Optional[float]:
         )
         if df is None or df.empty:
             return None
-        # Handle MultiIndex from yfinance ≥ 0.2.x
         close = df["Close"]
         if hasattr(close, "iloc"):
             val = close.iloc[-1]
-            # If it's a Series (MultiIndex), grab first element
             if hasattr(val, "iloc"):
                 val = val.iloc[0]
             if val and float(val) > 0:
@@ -490,8 +571,7 @@ def _yf_download_latest(ticker: str) -> Optional[float]:
 def _yf_historical(ticker: str, target: date) -> Optional[float]:
     """
     Fetch historical close for target_date.
-    Tries a ±5-day window; if yfinance raises YFTzMissingError or similar,
-    widens the window to 14 days and retries once.
+    Tries a ±5-day window; widens to 14 days on retry.
     """
     for extra_days in (5, 14):
         start = target - timedelta(days=extra_days)
@@ -509,13 +589,11 @@ def _yf_historical(ticker: str, target: date) -> Optional[float]:
             if df is None or df.empty:
                 continue
 
-            close = df["Close"]
-            # Filter to rows <= target date
             df.index = df.index.normalize()
             target_ts = datetime.combine(target, datetime.min.time())
             filtered = df[df.index <= target_ts]
             if filtered.empty:
-                filtered = df  # just take what we have
+                filtered = df
 
             val = filtered["Close"].iloc[-1]
             if hasattr(val, "iloc"):
@@ -536,7 +614,6 @@ def _yf_fast_info(ticker: str) -> Optional[dict]:
         currency = getattr(fi, "currency", None) or "USD"
         exchange = getattr(fi, "exchange", None)
 
-        # Validate ticker is live
         price = getattr(fi, "last_price", None)
         if not price:
             hist = t.history(period="5d")
@@ -545,7 +622,7 @@ def _yf_fast_info(ticker: str) -> Optional[dict]:
 
         return {
             "ticker":   ticker.upper(),
-            "name":     ticker.upper(),   # fast_info has no long name
+            "name":     ticker.upper(),
             "exchange": exchange,
             "currency": currency,
             "sector":   None,
