@@ -3,7 +3,7 @@ import { HttpClient, HttpParams } from '@angular/common/http';
 import { Observable } from 'rxjs';
 import {
   AuthResponse, TokenResponse, Portfolio, PortfolioSummary, Transaction, TransactionCreate,
-  Security, PortfolioAnalytics, BankSummary, OverallSummary,
+  Security, PortfolioAnalytics, BankSummary, OverallSummary, CandlePoint,
   BankAccount, BankAccountCreate, BankInterestRate, BankTransaction, BankTransactionCreate,
   FxRate, UserResponse, UserSettings, UserSettingsUpdate,
 } from '../models';
@@ -83,6 +83,10 @@ export class ApiService {
 
   getPortfolioAnalytics(portfolioId: number): Observable<PortfolioAnalytics> {
     return this.http.get<PortfolioAnalytics>(`${API}/analytics/portfolio/${portfolioId}`);
+  }
+  getCandles(portfolioId: number, ticker: string, days = 180): Observable<CandlePoint[]> {
+    const params = new HttpParams().set('days', days);
+    return this.http.get<CandlePoint[]>(`${API}/analytics/portfolio/${portfolioId}/candles/${ticker}`, { params });
   }
   getBankSummary(): Observable<BankSummary> {
     return this.http.get<BankSummary>(`${API}/analytics/bank`);

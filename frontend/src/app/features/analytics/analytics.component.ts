@@ -1,15 +1,37 @@
 import { Component, OnInit, signal } from '@angular/core';
 import { CommonModule } from '@angular/common';
 import { RouterLink, ActivatedRoute } from '@angular/router';
+import { FormsModule } from '@angular/forms';
 import { ApiService } from '../../core/services/api.service';
-import { PortfolioAnalytics, PeriodPnl, PositionProfit } from '../../core/models';
+import { PortfolioAnalytics, PeriodPnl, PositionProfit, CandlePoint } from '../../core/models';
 
 type Period = '1D' | '1W' | '1M' | '1Y';
+type CandleRange = 30 | 90 | 180 | 365;
+
+interface DonutSegment {
+  ticker: string;
+  color: string;
+  pct: number;
+  dasharray: string;
+  dashoffset: number;
+}
+
+interface CandleBar {
+  x: number;
+  width: number;
+  wickY1: number;
+  wickY2: number;
+  bodyY: number;
+  bodyHeight: number;
+  up: boolean;
+  date: string;
+  close: number;
+}
 
 @Component({
   selector: 'app-analytics',
   standalone: true,
-  imports: [CommonModule, RouterLink],
+  imports: [CommonModule, RouterLink, FormsModule],
   template: `
     <div class="page">
       <div class="page-header">
@@ -54,9 +76,12 @@ type Period = '1D' | '1W' | '1M' | '1Y';
               <div class="pnl-kzt num" [class.profit]="pnl.profit_kzt >= 0" [class.loss]="pnl.profit_kzt < 0">
                 {{ pnl.profit_kzt >= 0 ? '+' : '' }}₸ {{ pnl.profit_kzt | number:'1.0-0' }}
               </div>
+              <div class="pnl-note text-muted">
+                Real profit for the period — excludes any new money you added or withdrew during it.
+              </div>
               <div class="pnl-range">
                 <div class="range-item">
-                  <span class="range-label">Start</span>
+                  <span class="range-label">Start (held shares only)</span>
                   <span class="range-val num">{{ pnl.value_start_usd | currency:'USD':'symbol':'1.2-2' }}</span>
                 </div>
                 <div class="range-arrow">
@@ -120,7 +145,62 @@ type Period = '1D' | '1W' | '1M' | '1Y';
           </div>
         </div>
 
-        <!-- Position breakdown table -->
+        <!-- Candlestick price chart -->
+        <div class="card" style="margin-bottom:24px">
+          <div class="pos-table-header">
+            <h2>Price Chart</h2>
+            <div class="flex gap-2 items-center">
+              <select class="form-control ticker-select" [ngModel]="selectedTicker()" (ngModelChange)="loadCandles($event)">
+                @for (t of availableTickers(); track t) {
+                  <option [value]="t">{{ t }}</option>
+                }
+              </select>
+              <div class="tabs">
+                @for (r of candleRanges; track r) {
+                  <button class="tab" [class.active]="candleDays() === r" (click)="setCandleRange(r)">{{ r }}D</button>
+                }
+              </div>
+            </div>
+          </div>
+
+          @if (candlesLoading()) {
+            <div class="loading-overlay" style="padding:60px"><div class="spinner"></div></div>
+          } @else if (candleBars().length === 0) {
+            <div class="empty-state" style="padding:50px">
+              <div class="empty-icon">📉</div>
+              <div class="empty-title">No price history yet</div>
+              <div class="empty-desc">
+                Price history fills in daily once the Airflow ingest job runs, and on every
+                live price fetch in the meantime.
+              </div>
+            </div>
+          } @else {
+            <div class="candle-wrap">
+              <svg viewBox="0 0 800 280" class="candle-svg" preserveAspectRatio="none">
+                <!-- gridlines -->
+                @for (g of [0,1,2,3]; track g) {
+                  <line x1="0" [attr.x2]="800" [attr.y1]="g*70" [attr.y2]="g*70" class="grid-line" />
+                }
+                @for (bar of candleBars(); track bar.x) {
+                  <line [attr.x1]="bar.x" [attr.x2]="bar.x" [attr.y1]="bar.wickY1" [attr.y2]="bar.wickY2"
+                    [class.up]="bar.up" [class.down]="!bar.up" class="wick" />
+                  <rect [attr.x]="bar.x - bar.width/2" [attr.y]="bar.bodyY"
+                    [attr.width]="bar.width" [attr.height]="bar.bodyHeight"
+                    [class.up]="bar.up" [class.down]="!bar.up" class="candle-body" rx="1" />
+                }
+              </svg>
+              <div class="candle-axis">
+                <span>{{ candleMin() | number:'1.2-2' }}</span>
+                <span>{{ candleMax() | number:'1.2-2' }}</span>
+              </div>
+              <div class="candle-range-label text-muted">
+                {{ candles()[0]?.date }} → {{ candles()[candles().length - 1]?.date }}
+              </div>
+            </div>
+          }
+        </div>
+
+        <!-- Position breakdown -->
         <div class="card">
           <div class="pos-table-header">
             <h2>Position Breakdown</h2>
@@ -130,24 +210,36 @@ type Period = '1D' | '1W' | '1M' | '1Y';
           @if (analytics()!.positions_profit.length === 0) {
             <div class="empty-state"><div class="empty-icon">📊</div><div class="empty-title">No positions</div></div>
           } @else {
-            <!-- Portfolio composition bar -->
-            <div class="composition-bar">
-              @for (pos of analytics()!.positions_profit; track pos.ticker) {
-                <div class="comp-seg"
-                  [style.width.%]="getWeight(pos)"
-                  [style.background]="getTickerColor(pos.ticker)"
-                  [title]="pos.ticker + ': ' + getWeight(pos).toFixed(1) + '%'">
+            <div class="donut-section">
+              <!-- Donut chart -->
+              <div class="donut-wrap">
+                <svg viewBox="0 0 200 200" width="180" height="180">
+                  <circle cx="100" cy="100" r="70" fill="none" stroke="var(--bg-base)" stroke-width="30"></circle>
+                  @for (seg of donutSegments(); track seg.ticker) {
+                    <circle cx="100" cy="100" r="70" fill="none" stroke-width="30"
+                      [attr.stroke]="seg.color"
+                      [attr.stroke-dasharray]="seg.dasharray"
+                      [attr.stroke-dashoffset]="seg.dashoffset"
+                      transform="rotate(-90 100 100)"
+                      stroke-linecap="butt" />
+                  }
+                </svg>
+                <div class="donut-center">
+                  <div class="donut-center-label">Total</div>
+                  <div class="donut-center-val num">{{ analytics()!.total_value_usd | currency:'USD':'symbol':'1.0-0' }}</div>
                 </div>
-              }
-            </div>
-            <div class="comp-legend">
-              @for (pos of analytics()!.positions_profit; track pos.ticker) {
-                <div class="comp-leg-item">
-                  <span class="comp-dot" [style.background]="getTickerColor(pos.ticker)"></span>
-                  <span class="comp-tick mono">{{ pos.ticker }}</span>
-                  <span class="comp-pct">{{ getWeight(pos).toFixed(0) }}%</span>
-                </div>
-              }
+              </div>
+
+              <!-- Legend -->
+              <div class="donut-legend">
+                @for (seg of donutSegments(); track seg.ticker) {
+                  <div class="donut-leg-item">
+                    <span class="comp-dot" [style.background]="seg.color"></span>
+                    <span class="comp-tick mono">{{ seg.ticker }}</span>
+                    <span class="comp-pct">{{ seg.pct | number:'1.0-1' }}%</span>
+                  </div>
+                }
+              </div>
             </div>
 
             <table class="data-table">
@@ -226,6 +318,7 @@ type Period = '1D' | '1W' | '1M' | '1Y';
     .pnl-amount { font-size: 52px; font-weight: 400; letter-spacing: -2px; line-height: 1; }
     .pnl-pct { font-size: 24px; font-weight: 600; }
     .pnl-kzt { font-size: 18px; color: var(--text-secondary); }
+    .pnl-note { font-size: 11px; margin-top: 2px; }
     .pnl-range { display: flex; align-items: center; gap: 16px; margin-top: 12px; color: var(--text-muted); font-size: 13px; }
     .range-item { display: flex; flex-direction: column; gap: 2px; .range-label { font-size: 10px; text-transform: uppercase; letter-spacing: 0.5px; } .range-val { font-size: 15px; color: var(--text-secondary); } }
     .range-arrow { color: var(--text-muted); }
@@ -242,16 +335,31 @@ type Period = '1D' | '1W' | '1M' | '1Y';
     .spark-bar { height: 3px; background: var(--bg-base); border-radius: 2px; margin-top: 12px; overflow: hidden; }
     .spark-fill { height: 100%; border-radius: 2px; transition: width 0.5s ease; &.profit { background: var(--green); } &.loss { background: var(--red); } }
 
-    /* Composition bar */
-    .pos-table-header { display: flex; align-items: center; justify-content: space-between; padding: 18px 20px; border-bottom: 1px solid var(--border); h2 { font-family: var(--font-display); font-size: 15px; } }
+    /* Section header (shared) */
+    .pos-table-header { display: flex; align-items: center; justify-content: space-between; padding: 18px 20px; border-bottom: 1px solid var(--border); h2 { font-family: var(--font-display); font-size: 15px; } flex-wrap: wrap; gap: 10px; }
     .fx-note { font-size: 12px; }
-    .composition-bar { display: flex; height: 8px; margin: 16px 20px 8px; border-radius: 4px; overflow: hidden; gap: 1px; }
-    .comp-seg { height: 100%; transition: opacity var(--transition); &:hover { opacity: 0.75; } }
-    .comp-legend { display: flex; gap: 16px; flex-wrap: wrap; padding: 0 20px 16px; border-bottom: 1px solid var(--border); }
-    .comp-leg-item { display: flex; align-items: center; gap: 5px; font-size: 12px; }
-    .comp-dot { width: 8px; height: 8px; border-radius: 50%; flex-shrink: 0; }
-    .comp-tick { font-weight: 700; color: var(--text-primary); }
-    .comp-pct { color: var(--text-muted); }
+
+    /* Candlestick chart */
+    .ticker-select { width: auto; min-width: 100px; padding: 6px 10px; font-size: 12px; }
+    .candle-wrap { padding: 20px; position: relative; }
+    .candle-svg { width: 100%; height: 260px; display: block; }
+    .grid-line { stroke: var(--border); stroke-width: 1; }
+    .wick { stroke-width: 1.5; &.up { stroke: var(--green); } &.down { stroke: var(--red); } }
+    .candle-body { &.up { fill: var(--green); } &.down { fill: var(--red); } }
+    .candle-axis { position: absolute; top: 16px; right: 24px; display: flex; flex-direction: column; gap: 220px; font-size: 11px; color: var(--text-muted); font-family: var(--font-mono); }
+    .candle-range-label { text-align: center; font-size: 11px; margin-top: 6px; }
+
+    /* Donut chart */
+    .donut-section { display: flex; align-items: center; gap: 32px; padding: 20px 20px 8px; flex-wrap: wrap; }
+    .donut-wrap { position: relative; flex-shrink: 0; width: 180px; height: 180px; }
+    .donut-center { position: absolute; inset: 0; display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 2px; pointer-events: none; }
+    .donut-center-label { font-size: 10px; text-transform: uppercase; letter-spacing: 0.6px; color: var(--text-muted); }
+    .donut-center-val { font-size: 14px; font-weight: 600; }
+    .donut-legend { display: flex; flex-direction: column; gap: 10px; flex: 1; min-width: 160px; }
+    .donut-leg-item { display: flex; align-items: center; gap: 8px; font-size: 13px; }
+    .comp-dot { width: 9px; height: 9px; border-radius: 50%; flex-shrink: 0; }
+    .comp-tick { font-weight: 700; color: var(--text-primary); min-width: 50px; }
+    .comp-pct { color: var(--text-muted); margin-left: auto; }
 
     .color-dot { width: 8px; height: 8px; border-radius: 50%; flex-shrink: 0; }
     .num-col { text-align: right; }
@@ -271,11 +379,20 @@ export class AnalyticsComponent implements OnInit {
   selectedPeriod = signal<Period>('1M');
   periods: Period[] = ['1D', '1W', '1M', '1Y'];
 
+  // Candlestick chart state
+  candleRanges: CandleRange[] = [30, 90, 180, 365];
+  selectedTicker = signal<string>('');
+  candleDays = signal<CandleRange>(180);
+  candles = signal<CandlePoint[]>([]);
+  candlesLoading = signal(false);
+
   private readonly COLORS = [
     '#c8ff47', '#60a5fa', '#f472b6', '#fb923c', '#a78bfa',
     '#34d399', '#facc15', '#f87171', '#38bdf8', '#818cf8',
   ];
   private colorMap = new Map<string, string>();
+  private readonly DONUT_R = 70;
+  private readonly DONUT_CIRC = 2 * Math.PI * this.DONUT_R;
 
   currentPnl = () => {
     const a = this.analytics();
@@ -300,6 +417,8 @@ export class AnalyticsComponent implements OnInit {
       (a, b) => b.current_value_usd - a.current_value_usd
     );
 
+  availableTickers = () => (this.analytics()?.positions_profit || []).map(p => p.ticker);
+
   constructor(private route: ActivatedRoute, private api: ApiService) {}
 
   ngOnInit(): void {
@@ -310,10 +429,111 @@ export class AnalyticsComponent implements OnInit {
   load(): void {
     this.loading.set(true);
     this.api.getPortfolioAnalytics(this.portfolioId).subscribe({
-      next: (a) => { this.analytics.set(a); this.loading.set(false); },
+      next: (a) => {
+        this.analytics.set(a);
+        this.loading.set(false);
+        const tickers = a.positions_profit.map(p => p.ticker);
+        if (tickers.length && !tickers.includes(this.selectedTicker())) {
+          this.loadCandles(tickers[0]);
+        } else if (this.selectedTicker()) {
+          this.loadCandles(this.selectedTicker());
+        }
+      },
       error: () => this.loading.set(false),
     });
   }
+
+  // ── Candlestick chart ─────────────────────────────────────────────────
+
+  setCandleRange(days: CandleRange): void {
+    this.candleDays.set(days);
+    if (this.selectedTicker()) this.loadCandles(this.selectedTicker());
+  }
+
+  loadCandles(ticker: string): void {
+    if (!ticker) return;
+    this.selectedTicker.set(ticker);
+    this.candlesLoading.set(true);
+    this.api.getCandles(this.portfolioId, ticker, this.candleDays()).subscribe({
+      next: (c) => { this.candles.set(c); this.candlesLoading.set(false); },
+      error: () => { this.candles.set([]); this.candlesLoading.set(false); },
+    });
+  }
+
+  candleMin = () => {
+    const data = this.candles();
+    if (!data.length) return 0;
+    return Math.min(...data.map(d => d.low ?? d.close));
+  };
+
+  candleMax = () => {
+    const data = this.candles();
+    if (!data.length) return 0;
+    return Math.max(...data.map(d => d.high ?? d.close));
+  };
+
+  candleBars(): CandleBar[] {
+    const data = this.candles();
+    if (!data.length) return [];
+
+    const lows = data.map(d => d.low ?? Math.min(d.open ?? d.close, d.close));
+    const highs = data.map(d => d.high ?? Math.max(d.open ?? d.close, d.close));
+    const minP = Math.min(...lows);
+    const maxP = Math.max(...highs);
+    const range = (maxP - minP) || maxP * 0.01 || 1;
+
+    const width = 800;
+    const height = 280;
+    const padding = 12;
+    const barW = width / data.length;
+    const scaleY = (p: number) =>
+      height - padding - ((p - minP) / range) * (height - 2 * padding);
+
+    return data.map((d, i) => {
+      const o = d.open ?? d.close;
+      const c = d.close;
+      const h = d.high ?? Math.max(o, c);
+      const l = d.low ?? Math.min(o, c);
+      const up = c >= o;
+      const yOpen = scaleY(o);
+      const yClose = scaleY(c);
+      return {
+        x: i * barW + barW / 2,
+        width: Math.max(barW * 0.6, 1.5),
+        wickY1: scaleY(h),
+        wickY2: scaleY(l),
+        bodyY: Math.min(yOpen, yClose),
+        bodyHeight: Math.max(Math.abs(yClose - yOpen), 1),
+        up,
+        date: d.date,
+        close: c,
+      };
+    });
+  }
+
+  // ── Donut chart ────────────────────────────────────────────────────────
+
+  donutSegments(): DonutSegment[] {
+    const positions = this.analytics()?.positions_profit || [];
+    const total = this.analytics()?.total_value_usd || 1;
+    let offset = 0;
+    const segments: DonutSegment[] = [];
+    for (const pos of positions) {
+      const pct = total > 0 ? Math.max((pos.current_value_usd / total) * 100, 0) : 0;
+      const dash = (pct / 100) * this.DONUT_CIRC;
+      segments.push({
+        ticker: pos.ticker,
+        color: this.getTickerColor(pos.ticker),
+        pct,
+        dasharray: `${dash} ${this.DONUT_CIRC - dash}`,
+        dashoffset: -offset,
+      });
+      offset += dash;
+    }
+    return segments;
+  }
+
+  // ── Shared helpers ────────────────────────────────────────────────────
 
   getWeight(pos: PositionProfit): number {
     const total = this.analytics()?.total_value_usd || 1;

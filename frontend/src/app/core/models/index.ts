@@ -138,6 +138,16 @@ export interface PositionProfit {
   profit_percent: number;
 }
 
+// Candlestick chart data — sourced from price_history
+export interface CandlePoint {
+  date: string;
+  open?: number;
+  high?: number;
+  low?: number;
+  close: number;
+  volume?: number;
+}
+
 export interface BankSummary {
   total_kzt: number;
   total_usd: number;

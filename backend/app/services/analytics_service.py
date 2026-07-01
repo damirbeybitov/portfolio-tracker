@@ -6,6 +6,22 @@ price_history write-through:
   session and a ticker→security_id map so live fetched prices are upserted
   into price_history automatically — no data gap between Airflow DAG runs.
 
+Period P&L — "real" profit, not paper-extrapolated:
+  Naively multiplying *current* quantity by a historical price overstates
+  gains whenever a position was opened (or added to) partway through the
+  period — the newly bought shares get credited with gains they never
+  actually earned. Instead we compute, per period:
+
+      profit = (value_now - value_at_period_start)
+               - cash_invested_during_period      (cost of BUYs in window)
+               + cash_withdrawn_during_period      (proceeds of SELLs in window)
+
+  value_at_period_start uses the *actual quantity held at that date*
+  (replayed from transaction history), not today's quantity. This means a
+  stock bought yesterday contributes ~0 to the "1Y" profit instead of a
+  full year of (current_price - price_one_year_ago) on a position that
+  didn't exist a year ago.
+
 Period P&L uses price_history first (fast, no external call), falls back to
 the live provider chain only when a historical row is missing.
 """
@@ -29,9 +45,11 @@ from app.models.bank import (
     BankTransactionType,
 )
 from app.models.portfolio import Portfolio, Position, Security
-from app.models.transaction import Transaction
+from app.models.price_history import PriceHistory
+from app.models.transaction import Transaction, TransactionType
 from app.schemas.analytics import (
     BankSummary,
+    CandlePoint,
     OverallSummary,
     PeriodPnl,
     PortfolioAnalytics,
@@ -152,14 +170,34 @@ class AnalyticsService:
             return ph_prices
 
         hist_tasks = [fetch_hist_batch(d) for d in period_dates.values()]
+
+        # Per-period: actual quantity held at the start date (replayed from
+        # transaction history) and net cash invested/withdrawn during the
+        # window — both needed for the "real profit" formula.
+        qty_tasks = [
+            AnalyticsService._qty_at_date_batch(db, portfolio_id, security_ids, d)
+            for d in period_dates.values()
+        ]
+        cashflow_tasks = [
+            AnalyticsService._net_cashflow(db, portfolio_id, d, today)
+            for d in period_dates.values()
+        ]
+
         all_results = await asyncio.gather(
-            current_prices_task, *hist_tasks, return_exceptions=False
+            current_prices_task, *hist_tasks, *qty_tasks, *cashflow_tasks,
+            return_exceptions=False,
         )
 
+        n = len(period_dates)
         current_prices: dict[str, Optional[float]] = all_results[0]
         hist_by_period: dict[str, dict[str, Optional[float]]] = {
-            key: all_results[i + 1]
-            for i, key in enumerate(period_dates.keys())
+            key: all_results[1 + i] for i, key in enumerate(period_dates.keys())
+        }
+        qty_at_start_by_period: dict[str, dict[int, Decimal]] = {
+            key: all_results[1 + n + i] for i, key in enumerate(period_dates.keys())
+        }
+        cashflow_by_period: dict[str, tuple[Decimal, Decimal]] = {
+            key: all_results[1 + 2 * n + i] for i, key in enumerate(period_dates.keys())
         }
 
         # Build current snapshot
@@ -208,6 +246,7 @@ class AnalyticsService:
 
         def build_pnl(period_key: str) -> PeriodPnl:
             hist = hist_by_period[period_key]
+            qty_start_map = qty_at_start_by_period[period_key]
             value_start = ZERO
             value_end = ZERO
             for pos in positions:
@@ -220,11 +259,19 @@ class AnalyticsService:
                     Decimal(str(curr)) if curr and curr > 0 else pos.avg_cost_usd
                 )
                 hist_dec = Decimal(str(h)) if h and h > 0 else curr_dec
+                qty_start = qty_start_map.get(pos.security_id, ZERO)
                 value_end += curr_dec * pos.quantity
-                value_start += hist_dec * pos.quantity
+                # Only the quantity actually held at the start of the period
+                # counts toward "starting value" — shares bought mid-period
+                # had zero value to you before you owned them.
+                value_start += hist_dec * qty_start
 
-            profit = value_end - value_start
-            profit_pct = (profit / value_start * 100) if value_start else ZERO
+            net_buys, net_sells = cashflow_by_period[period_key]
+            # Real profit = market movement on what you actually held,
+            # excluding fresh capital you put in (or took out) mid-period.
+            profit = (value_end - value_start) - net_buys + net_sells
+            basis = value_start + net_buys
+            profit_pct = (profit / basis * 100) if basis else ZERO
             return PeriodPnl(
                 period=period_key,  # type: ignore[arg-type]
                 profit_usd=profit,
@@ -248,6 +295,83 @@ class AnalyticsService:
             fx_rate=fx_rate,
             positions_profit=positions_profit,
         )
+
+    # ------------------------------------------------------------------ #
+    #  Real-quantity-at-date + cash-flow helpers                          #
+    # ------------------------------------------------------------------ #
+
+    @staticmethod
+    async def _qty_at_date_batch(
+        db: AsyncSession,
+        portfolio_id: int,
+        security_ids: list[int],
+        as_of_date: date,
+    ) -> dict[int, Decimal]:
+        """
+        Replay BUY/SELL/SPLIT transactions dated strictly before *as_of_date*
+        to get the quantity actually held, per security, at that point in
+        time — not today's quantity. One query for the whole portfolio,
+        rows already ordered so SPLIT multipliers apply in the right place.
+        """
+        if not security_ids:
+            return {}
+
+        result = await db.execute(
+            select(Transaction)
+            .where(
+                and_(
+                    Transaction.portfolio_id == portfolio_id,
+                    Transaction.security_id.in_(security_ids),
+                    Transaction.date < as_of_date,
+                )
+            )
+            .order_by(Transaction.date.asc(), Transaction.created_at.asc())
+        )
+        txs = result.scalars().all()
+
+        qty: dict[int, Decimal] = {sid: ZERO for sid in security_ids}
+        for tx in txs:
+            sid = tx.security_id
+            if sid not in qty:
+                continue
+            if tx.type == TransactionType.BUY:
+                qty[sid] += tx.quantity
+            elif tx.type == TransactionType.SELL:
+                qty[sid] -= tx.quantity
+            elif tx.type == TransactionType.SPLIT and tx.split_ratio:
+                qty[sid] = qty[sid] * tx.split_ratio
+        return qty
+
+    @staticmethod
+    async def _net_cashflow(
+        db: AsyncSession, portfolio_id: int, start_date: date, end_date: date
+    ) -> tuple[Decimal, Decimal]:
+        """
+        Total cost of BUYs and proceeds of SELLs strictly after start_date
+        and on/before end_date — the "new money in / out" that must be
+        excluded from period P&L so it isn't mistaken for market gain.
+        """
+        result = await db.execute(
+            select(Transaction.type, func.sum(Transaction.total_usd))
+            .where(
+                and_(
+                    Transaction.portfolio_id == portfolio_id,
+                    Transaction.date > start_date,
+                    Transaction.date <= end_date,
+                    Transaction.type.in_([TransactionType.BUY, TransactionType.SELL]),
+                )
+            )
+            .group_by(Transaction.type)
+        )
+        buys = ZERO
+        sells = ZERO
+        for t_type, total in result.all():
+            amount = Decimal(str(total or 0))
+            if t_type == TransactionType.BUY:
+                buys = amount
+            elif t_type == TransactionType.SELL:
+                sells = amount
+        return buys, sells
 
     # ------------------------------------------------------------------ #
     #  price_history lookup helper                                         #
@@ -296,6 +420,63 @@ class AnalyticsService:
                 prices[ticker] = float(row.close)
 
         return prices
+
+    # ------------------------------------------------------------------ #
+    #  Candle (OHLC) data — for the candlestick chart                     #
+    # ------------------------------------------------------------------ #
+
+    @staticmethod
+    async def get_candles(
+        db: AsyncSession,
+        user_id: int,
+        portfolio_id: int,
+        ticker: str,
+        days: int = 180,
+    ) -> list[CandlePoint]:
+        """
+        OHLCV history for a held ticker, straight from price_history (filled
+        by the Airflow daily DAG and by every live price fetch). Used to
+        render a real candlestick chart on the Analytics page.
+        """
+        result = await db.execute(
+            select(Portfolio).where(
+                and_(Portfolio.id == portfolio_id, Portfolio.user_id == user_id)
+            )
+        )
+        if not result.scalar_one_or_none():
+            raise HTTPException(status_code=404, detail="Portfolio not found")
+
+        sec_result = await db.execute(
+            select(Security).where(Security.ticker == ticker.upper())
+        )
+        security = sec_result.scalar_one_or_none()
+        if not security:
+            raise HTTPException(status_code=404, detail=f"Security '{ticker}' not found")
+
+        start = date.today() - timedelta(days=max(days, 1))
+        ph_result = await db.execute(
+            select(PriceHistory)
+            .where(
+                and_(
+                    PriceHistory.security_id == security.id,
+                    PriceHistory.date >= start,
+                )
+            )
+            .order_by(PriceHistory.date.asc())
+        )
+        rows = ph_result.scalars().all()
+
+        return [
+            CandlePoint(
+                date=r.date.isoformat(),
+                open=r.open,
+                high=r.high,
+                low=r.low,
+                close=r.close,
+                volume=r.volume,
+            )
+            for r in rows
+        ]
 
     # ------------------------------------------------------------------ #
     #  Bank summary                                                        #

@@ -1,6 +1,6 @@
 from pydantic import BaseModel
 from decimal import Decimal
-from typing import Literal
+from typing import Literal, Optional
 
 PeriodType = Literal["1D", "1W", "1M", "1Y", "ALL"]
 
@@ -51,3 +51,13 @@ class OverallSummary(BaseModel):
     grand_total_usd: Decimal
     grand_total_kzt: Decimal
     fx_rate: Decimal
+
+
+class CandlePoint(BaseModel):
+    """One OHLCV bar, sourced from price_history (Airflow-ingested or live write-through)."""
+    date: str
+    open: Optional[Decimal] = None
+    high: Optional[Decimal] = None
+    low: Optional[Decimal] = None
+    close: Decimal
+    volume: Optional[int] = None
