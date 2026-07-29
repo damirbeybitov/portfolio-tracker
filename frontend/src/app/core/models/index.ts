@@ -243,6 +243,17 @@ export interface BankTransactionCreate {
   portfolio_id?: number;
 }
 
+/**
+ * Partial PATCH payload — all fields optional.
+ * amount is blocked server-side for STOCK_BUY / STOCK_SELL.
+ */
+export interface BankTransactionUpdate {
+  date?: string;
+  amount?: number;
+  fx_rate?: number;
+  notes?: string;
+}
+
 export interface FxRate {
   date: string;
   usd_to_kzt: number;

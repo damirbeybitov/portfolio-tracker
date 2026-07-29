@@ -8,7 +8,8 @@ from app.core.security import get_current_user_id
 from app.schemas.bank import (
     BankAccountCreate, BankAccountUpdate, BankAccountResponse,
     BankInterestRateCreate, BankInterestRateResponse,
-    BankTransactionCreate, BankTransactionImportResult, BankTransactionResponse,
+    BankTransactionCreate, BankTransactionUpdate,
+    BankTransactionImportResult, BankTransactionResponse,
     FxRateCreate, FxRateResponse,
 )
 from app.services.bank_service import BankService
@@ -118,6 +119,32 @@ async def add_transaction(
     return await BankService.add_transaction(db, user_id, account_id, data)
 
 
+@router.patch(
+    "/accounts/{account_id}/transactions/{transaction_id}",
+    response_model=BankTransactionResponse,
+)
+async def update_transaction(
+    account_id: int,
+    transaction_id: int,
+    data: BankTransactionUpdate,
+    user_id: int = Depends(get_current_user_id),
+    db: AsyncSession = Depends(get_db),
+):
+    """
+    Partially update a bank transaction.
+
+    All fields are optional (standard PATCH semantics — omit what you don't
+    want to change):
+    - **date** — always editable.
+    - **notes** — always editable.
+    - **fx_rate** — always editable.
+    - **amount** — editable for non-stock transactions only; applying the
+      delta to the account's live balance.  For STOCK_BUY / STOCK_SELL,
+      delete the transaction and re-add it with the correct amount instead.
+    """
+    return await BankService.update_transaction(db, user_id, account_id, transaction_id, data)
+
+
 @router.delete("/accounts/{account_id}/transactions/{transaction_id}", status_code=204)
 async def delete_bank_transaction(
     account_id: int,
@@ -131,16 +158,24 @@ async def delete_bank_transaction(
     """
     await BankService.delete_transaction(db, user_id, account_id, transaction_id)
 
-@router.post("/accounts/{account_id}/transactions/import", response_model=BankTransactionImportResult, status_code=201)
+
+@router.post(
+    "/accounts/{account_id}/transactions/import",
+    response_model=BankTransactionImportResult,
+    status_code=201,
+)
 async def import_bank_transactions(
     account_id: int,
     file: UploadFile = File(...),
     user_id: int = Depends(get_current_user_id),
     db: AsyncSession = Depends(get_db),
 ):
-    """Bulk-import bank transactions from CSV/Excel. Required: type, date, amount. Optional: fx_rate, related_account_id, notes."""
+    """Bulk-import bank transactions from CSV/Excel."""
     content = await file.read()
-    return await ImportService.import_bank_transactions(db, user_id, account_id, await file.read(), file.filename)
+    return await ImportService.import_bank_transactions(
+        db, user_id, account_id, content, file.filename
+    )
+
 
 # ── FX Rates ──────────────────────────────────────────────────────────────────
 

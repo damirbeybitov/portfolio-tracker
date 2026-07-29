@@ -4,18 +4,21 @@ import { FormsModule } from '@angular/forms';
 import { ApiService } from '../../core/services/api.service';
 import {
   BankAccount, BankAccountCreate, BankTransaction, BankTransactionCreate,
-  BankInterestRate, BankTransactionType, AccountCurrency,
-  UserSettings, Portfolio, Security
+  BankTransactionUpdate, BankInterestRate, BankTransactionType,
+  AccountCurrency, UserSettings, Portfolio, Security,
 } from '../../core/models';
 
 const TX_BADGES: Record<string, string> = {
   INCOME: 'badge-green', EXPENSE: 'badge-red', INTEREST: 'badge-blue',
   TRANSFER_IN: 'badge-green', TRANSFER_OUT: 'badge-red',
   STOCK_BUY: 'badge-red', STOCK_SELL: 'badge-green',
-  DIVIDEND: 'badge-blue', TAX: 'badge-amber', COMMISSION: 'badge-amber', EXCHANGE: 'badge-muted'
+  DIVIDEND: 'badge-blue', TAX: 'badge-amber', COMMISSION: 'badge-amber', EXCHANGE: 'badge-muted',
 };
 
 const STOCK_TYPES: BankTransactionType[] = ['STOCK_BUY', 'STOCK_SELL'];
+
+/** Which mode the Add/Edit/Copy modal is running in. */
+type ModalMode = 'create' | 'edit' | 'copy';
 
 @Component({
   selector: 'app-bank',
@@ -159,12 +162,12 @@ const STOCK_TYPES: BankTransactionType[] = ['STOCK_BUY', 'STOCK_SELL'];
                         <th class="num-col">Balance After</th>
                         <th class="num-col">FX Rate</th>
                         <th>Notes</th>
-                        <th></th>
+                        <th class="actions-col"></th>
                       </tr>
                     </thead>
                     <tbody>
                       @for (tx of selectedTxs(); track tx.id) {
-                        <tr [class.deleting]="deletingTxId() === tx.id">
+                        <tr [class.deleting]="deletingTxId() === tx.id" [class.editing]="editingTxId() === tx.id">
                           <td class="num date-cell">{{ tx.date | date:'dd MMM yyyy' }}</td>
                           <td><span class="badge" [class]="getTxBadge(tx.type)">{{ tx.type }}</span></td>
                           <td>
@@ -184,27 +187,54 @@ const STOCK_TYPES: BankTransactionType[] = ['STOCK_BUY', 'STOCK_SELL'];
                             {{ selectedAccount()!.currency === 'USD' ? '$' : '₸' }}{{ tx.balance_after | number:'1.2-2' }}
                           </td>
                           <td class="num-col num text-secondary">{{ tx.fx_rate ? (tx.fx_rate | number:'1.2-2') : '—' }}</td>
-                          <td class="text-secondary" style="font-size:12px">{{ tx.notes || '' }}</td>
-                          <td class="action-cell">
-                            <button class="btn-delete"
-                              [class.confirming]="confirmBankTxId() === tx.id"
-                              [disabled]="deletingTxId() === tx.id"
-                              (click)="onDeleteTxClick(tx)"
-                              [title]="isStockType(tx.type) ? 'Deletes portfolio transaction too' : 'Delete'">
-                              @if (deletingTxId() === tx.id) {
-                                <div class="spinner" style="width:14px;height:14px;border-width:2px"></div>
-                              } @else if (confirmBankTxId() === tx.id) {
-                                <svg width="14" height="14" fill="none" stroke="currentColor" stroke-width="2.5" viewBox="0 0 24 24"><polyline points="20 6 9 17 4 12"/></svg>
-                                <span>{{ isStockType(tx.type) ? 'Confirm (removes portfolio tx)' : 'Confirm' }}</span>
-                              } @else {
-                                <svg width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24">
-                                  <polyline points="3 6 5 6 21 6"/>
-                                  <path d="M19 6l-1 14a2 2 0 0 1-2 2H8a2 2 0 0 1-2-2L5 6"/>
-                                  <path d="M10 11v6M14 11v6"/>
-                                  <path d="M9 6V4a1 1 0 0 1 1-1h4a1 1 0 0 1 1 1v2"/>
+                          <td class="notes-cell">
+                            @if (tx.notes) {
+                              <span class="note-text" [title]="tx.notes">{{ tx.notes }}</span>
+                            }
+                          </td>
+                          <td class="actions-col">
+                            <div class="row-actions">
+                              <!-- Edit -->
+                              <button class="btn-icon"
+                                (click)="openEditModal(tx)"
+                                title="Edit transaction"
+                                [disabled]="deletingTxId() === tx.id">
+                                <svg width="13" height="13" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24">
+                                  <path d="M11 4H4a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2v-7"/>
+                                  <path d="M18.5 2.5a2.121 2.121 0 0 1 3 3L12 15l-4 1 1-4 9.5-9.5z"/>
                                 </svg>
-                              }
-                            </button>
+                              </button>
+                              <!-- Copy -->
+                              <button class="btn-icon"
+                                (click)="openCopyModal(tx)"
+                                title="Duplicate transaction"
+                                [disabled]="deletingTxId() === tx.id">
+                                <svg width="13" height="13" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24">
+                                  <rect x="9" y="9" width="13" height="13" rx="2" ry="2"/>
+                                  <path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/>
+                                </svg>
+                              </button>
+                              <!-- Delete -->
+                              <button class="btn-delete"
+                                [class.confirming]="confirmBankTxId() === tx.id"
+                                [disabled]="deletingTxId() === tx.id"
+                                (click)="onDeleteTxClick(tx)"
+                                [title]="isStockType(tx.type) ? 'Deletes portfolio transaction too' : 'Delete'">
+                                @if (deletingTxId() === tx.id) {
+                                  <div class="spinner" style="width:14px;height:14px;border-width:2px"></div>
+                                } @else if (confirmBankTxId() === tx.id) {
+                                  <svg width="14" height="14" fill="none" stroke="currentColor" stroke-width="2.5" viewBox="0 0 24 24"><polyline points="20 6 9 17 4 12"/></svg>
+                                  <span>{{ isStockType(tx.type) ? 'Confirm (removes portfolio tx)' : 'Confirm' }}</span>
+                                } @else {
+                                  <svg width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24">
+                                    <polyline points="3 6 5 6 21 6"/>
+                                    <path d="M19 6l-1 14a2 2 0 0 1-2 2H8a2 2 0 0 1-2-2L5 6"/>
+                                    <path d="M10 11v6M14 11v6"/>
+                                    <path d="M9 6V4a1 1 0 0 1 1-1h4a1 1 0 0 1 1 1v2"/>
+                                  </svg>
+                                }
+                              </button>
+                            </div>
                           </td>
                         </tr>
                       }
@@ -218,7 +248,7 @@ const STOCK_TYPES: BankTransactionType[] = ['STOCK_BUY', 'STOCK_SELL'];
       }
     </div>
 
-    <!-- Create Account Modal -->
+    <!-- ── Create Account Modal ──────────────────────────────────────────── -->
     @if (showCreateModal) {
       <div class="modal-backdrop" (click)="showCreateModal = false">
         <div class="modal" (click)="$event.stopPropagation()">
@@ -258,28 +288,69 @@ const STOCK_TYPES: BankTransactionType[] = ['STOCK_BUY', 'STOCK_SELL'];
       </div>
     }
 
-    <!-- Add Transaction Modal -->
+    <!-- ── Add / Edit / Copy Transaction Modal ───────────────────────────── -->
     @if (showTxModal) {
-      <div class="modal-backdrop" (click)="showTxModal = false">
+      <div class="modal-backdrop" (click)="closeTxModal()">
         <div class="modal modal-lg" (click)="$event.stopPropagation()">
           <div class="modal-header">
             <div>
-              <h3>Add Transaction — {{ txTargetAccount?.name }}</h3>
-              <!-- Type pills -->
+              <!-- Title changes per mode -->
+              <div class="modal-mode-badge">
+                @if (modalMode === 'edit') {
+                  <span class="mode-chip mode-edit">
+                    <svg width="11" height="11" fill="none" stroke="currentColor" stroke-width="2.5" viewBox="0 0 24 24">
+                      <path d="M11 4H4a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2v-7"/>
+                      <path d="M18.5 2.5a2.121 2.121 0 0 1 3 3L12 15l-4 1 1-4 9.5-9.5z"/>
+                    </svg>
+                    Editing transaction
+                  </span>
+                } @else if (modalMode === 'copy') {
+                  <span class="mode-chip mode-copy">
+                    <svg width="11" height="11" fill="none" stroke="currentColor" stroke-width="2.5" viewBox="0 0 24 24">
+                      <rect x="9" y="9" width="13" height="13" rx="2" ry="2"/>
+                      <path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/>
+                    </svg>
+                    Duplicating transaction
+                  </span>
+                }
+              </div>
+
+              <h3>
+                @if (modalMode === 'edit') { Edit Transaction — {{ txTargetAccount?.name }}
+                } @else if (modalMode === 'copy') { Copy Transaction — {{ txTargetAccount?.name }}
+                } @else { Add Transaction — {{ txTargetAccount?.name }} }
+              </h3>
+
+              <!-- Type pills (disabled in edit mode — type cannot change) -->
               <div class="tx-type-pills">
                 @for (grp of txTypeGroups; track grp.label) {
                   <div class="type-group">
                     <span class="group-label">{{ grp.label }}</span>
                     @for (t of grp.types; track t.value) {
-                      <button class="type-pill" [class.active]="newTx.type === t.value"
-                        (click)="selectTxType(t.value)">{{ t.label }}</button>
+                      <button class="type-pill"
+                        [class.active]="newTx.type === t.value"
+                        [disabled]="modalMode === 'edit'"
+                        (click)="modalMode !== 'edit' && selectTxType(t.value)">
+                        {{ t.label }}
+                      </button>
                     }
                   </div>
                 }
               </div>
+
+              @if (modalMode === 'edit' && isStockType(newTx.type)) {
+                <div class="edit-stock-notice">
+                  <svg width="13" height="13" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24" style="flex-shrink:0">
+                    <circle cx="12" cy="12" r="10"/><line x1="12" y1="8" x2="12" y2="12"/><line x1="12" y1="16" x2="12.01" y2="16"/>
+                  </svg>
+                  For stock transactions you can edit <strong>date</strong>, <strong>FX rate</strong>, and <strong>notes</strong>.
+                  To change the amount or ticker, delete and re-add this transaction.
+                </div>
+              }
             </div>
-            <button class="btn btn-ghost btn-sm" (click)="showTxModal = false">✕</button>
+            <button class="btn btn-ghost btn-sm" (click)="closeTxModal()">✕</button>
           </div>
+
           <div class="modal-body">
             @if (txError) { <div class="alert alert-error">{{ txError }}</div> }
 
@@ -288,15 +359,17 @@ const STOCK_TYPES: BankTransactionType[] = ['STOCK_BUY', 'STOCK_SELL'];
               <div class="stock-section">
                 <div class="stock-section-title">
                   {{ newTx.type === 'STOCK_BUY' ? '📈 Buying stock' : '📉 Selling stock' }}
-                  <span class="text-muted" style="font-size:12px;font-weight:400">
-                    — portfolio transaction will be created automatically
-                  </span>
+                  @if (modalMode === 'create' || modalMode === 'copy') {
+                    <span class="text-muted" style="font-size:12px;font-weight:400">
+                      — portfolio transaction will be created automatically
+                    </span>
+                  }
                 </div>
 
                 <!-- Portfolio selector -->
                 <div class="form-group">
                   <label>Portfolio</label>
-                  <select class="form-control" [(ngModel)]="newTx.portfolio_id">
+                  <select class="form-control" [(ngModel)]="newTx.portfolio_id" [disabled]="modalMode === 'edit'">
                     <option [value]="undefined">Select portfolio...</option>
                     @for (p of portfolios(); track p.id) {
                       <option [value]="p.id">{{ p.name }}</option>
@@ -304,10 +377,16 @@ const STOCK_TYPES: BankTransactionType[] = ['STOCK_BUY', 'STOCK_SELL'];
                   </select>
                 </div>
 
-                <!-- Ticker search -->
+                <!-- Ticker -->
                 <div class="form-group">
                   <label>Ticker</label>
-                  @if (!selectedSecurity) {
+                  @if (modalMode === 'edit') {
+                    <!-- In edit mode, ticker is read-only -->
+                    <div class="selected-sec">
+                      <span class="badge badge-accent mono">{{ newTx.ticker }}</span>
+                      <span class="sel-name text-muted" style="font-size:12px">Cannot be changed — delete & re-add instead</span>
+                    </div>
+                  } @else if (!selectedSecurity) {
                     <div class="search-wrap">
                       <input type="text" class="form-control" [(ngModel)]="tickerSearch"
                         (input)="searchSecurities()"
@@ -356,11 +435,17 @@ const STOCK_TYPES: BankTransactionType[] = ['STOCK_BUY', 'STOCK_SELL'];
                 <div class="tx-grid">
                   <div class="form-group">
                     <label>Quantity (shares)</label>
-                    <input type="number" class="form-control" [(ngModel)]="newTx.quantity" min="0.0001" step="0.0001" placeholder="10">
+                    <input type="number" class="form-control"
+                      [(ngModel)]="newTx.quantity"
+                      [disabled]="modalMode === 'edit'"
+                      min="0.0001" step="0.0001" placeholder="10">
                   </div>
                   <div class="form-group">
                     <label>Price per share ({{ txTargetAccount?.currency }})</label>
-                    <input type="number" class="form-control" [(ngModel)]="newTx.price_per_share" min="0" step="0.01" placeholder="0.00"
+                    <input type="number" class="form-control"
+                      [(ngModel)]="newTx.price_per_share"
+                      [disabled]="modalMode === 'edit'"
+                      min="0" step="0.01" placeholder="0.00"
                       (input)="recalcStockAmount()">
                   </div>
                   <div class="form-group">
@@ -381,8 +466,7 @@ const STOCK_TYPES: BankTransactionType[] = ['STOCK_BUY', 'STOCK_SELL'];
                   </div>
                 </div>
 
-                <!-- Amount preview -->
-                @if (stockAmountPreview()) {
+                @if (stockAmountPreview() !== null && modalMode !== 'edit') {
                   <div class="tx-preview-box">
                     <div class="preview-row">
                       <span>{{ newTx.type === 'STOCK_SELL' ? 'Proceeds' : 'Total Cost' }}</span>
@@ -401,6 +485,7 @@ const STOCK_TYPES: BankTransactionType[] = ['STOCK_BUY', 'STOCK_SELL'];
                   <input type="text" class="form-control" [(ngModel)]="newTx.notes" placeholder="e.g. Long-term hold">
                 </div>
               </div>
+
             } @else {
               <!-- ── Regular transaction fields ── -->
               <div class="form-group">
@@ -408,14 +493,17 @@ const STOCK_TYPES: BankTransactionType[] = ['STOCK_BUY', 'STOCK_SELL'];
                 <input type="date" class="form-control" [(ngModel)]="newTx.date">
               </div>
               <div class="form-group">
-                <label>Amount <span class="text-muted">(positive = money in, negative = money out)</span></label>
+                <label>
+                  Amount
+                  <span class="text-muted">(positive = money in, negative = money out)</span>
+                </label>
                 <input type="number" class="form-control" [(ngModel)]="newTx.amount" step="0.01">
               </div>
 
               @if (newTx.type === 'TRANSFER_IN' || newTx.type === 'TRANSFER_OUT') {
                 <div class="form-group">
                   <label>Related Account</label>
-                  <select class="form-control" [(ngModel)]="newTx.related_account_id">
+                  <select class="form-control" [(ngModel)]="newTx.related_account_id" [disabled]="modalMode === 'edit'">
                     <option [value]="undefined">None</option>
                     @for (acc of visibleAccounts(); track acc.id) {
                       @if (acc.id !== txTargetAccount?.id) {
@@ -448,17 +536,26 @@ const STOCK_TYPES: BankTransactionType[] = ['STOCK_BUY', 'STOCK_SELL'];
               </div>
             }
           </div>
+
           <div class="modal-footer">
-            <button class="btn btn-secondary" (click)="showTxModal = false">Cancel</button>
-            <button class="btn btn-primary" (click)="addTransaction()" [disabled]="txModalLoading">
-              @if (txModalLoading) { <span class="spinner"></span> } @else { Add Transaction }
+            <button class="btn btn-secondary" (click)="closeTxModal()">Cancel</button>
+            <button class="btn btn-primary" (click)="submitTxModal()" [disabled]="txModalLoading">
+              @if (txModalLoading) {
+                <span class="spinner"></span>
+              } @else if (modalMode === 'edit') {
+                Save Changes
+              } @else if (modalMode === 'copy') {
+                Create Copy
+              } @else {
+                Add Transaction
+              }
             </button>
           </div>
         </div>
       </div>
     }
 
-    <!-- Set Interest Rate Modal -->
+    <!-- ── Set Interest Rate Modal ───────────────────────────────────────── -->
     @if (showRateModal) {
       <div class="modal-backdrop" (click)="showRateModal = false">
         <div class="modal" (click)="$event.stopPropagation()">
@@ -503,7 +600,7 @@ const STOCK_TYPES: BankTransactionType[] = ['STOCK_BUY', 'STOCK_SELL'];
       </div>
     }
 
-    <!-- FX Rate Modal -->
+    <!-- ── FX Rate Modal ─────────────────────────────────────────────────── -->
     @if (showFxModal) {
       <div class="modal-backdrop" (click)="showFxModal = false">
         <div class="modal" (click)="$event.stopPropagation()">
@@ -559,9 +656,28 @@ const STOCK_TYPES: BankTransactionType[] = ['STOCK_BUY', 'STOCK_SELL'];
     .ac-rate { display: flex; align-items: center; gap: 5px; font-size: 12px; color: var(--green); }
     .ac-actions { display: flex; gap: 8px; margin-top: 8px; padding-top: 14px; border-top: 1px solid var(--border); align-items: center; }
     .detail-header { display: flex; align-items: center; justify-content: space-between; margin-bottom: 16px; h2 { font-family: var(--font-display); font-size: 16px; } }
+
+    /* Table */
     .num-col { text-align: right; }
     .date-cell { color: var(--text-secondary); font-size: 13px; white-space: nowrap; }
+    .notes-cell { max-width: 180px; }
+    .note-text { font-size: 12px; color: var(--text-secondary); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; display: block; }
     .stock-details { display: flex; flex-direction: column; gap: 2px; }
+
+    /* Row actions */
+    .actions-col { width: 130px; text-align: right; padding-right: 12px !important; white-space: nowrap; }
+    .row-actions { display: inline-flex; align-items: center; gap: 4px; }
+    tr.editing td { background: var(--accent-dim); }
+    tr.deleting td { opacity: 0.4; transition: opacity 0.2s; }
+
+    .btn-icon {
+      display: inline-flex; align-items: center; justify-content: center;
+      width: 28px; height: 28px; border-radius: var(--radius-sm);
+      border: 1px solid transparent; cursor: pointer; background: transparent;
+      color: var(--text-muted); transition: all var(--transition);
+      &:hover:not(:disabled) { background: var(--bg-elevated); border-color: var(--border-active); color: var(--text-primary); }
+      &:disabled { opacity: 0.4; cursor: not-allowed; }
+    }
 
     /* Transaction type pills */
     .tx-type-pills { display: flex; gap: 16px; flex-wrap: wrap; margin-top: 12px; }
@@ -571,8 +687,26 @@ const STOCK_TYPES: BankTransactionType[] = ['STOCK_BUY', 'STOCK_SELL'];
       padding: 4px 12px; border-radius: 20px; font-size: 12px; font-weight: 600;
       border: 1px solid var(--border); background: transparent; cursor: pointer;
       color: var(--text-secondary); transition: all var(--transition);
-      &:hover { border-color: var(--border-active); color: var(--text-primary); }
+      &:hover:not(:disabled) { border-color: var(--border-active); color: var(--text-primary); }
       &.active { background: var(--accent); color: var(--text-inverse); border-color: var(--accent); }
+      &:disabled { opacity: 0.5; cursor: not-allowed; }
+    }
+
+    /* Modal mode indicator */
+    .modal-mode-badge { margin-bottom: 6px; }
+    .mode-chip {
+      display: inline-flex; align-items: center; gap: 5px;
+      padding: 3px 10px; border-radius: 20px; font-size: 11px; font-weight: 600;
+    }
+    .mode-edit { background: var(--amber-dim); color: var(--amber); border: 1px solid rgba(251,191,36,0.3); }
+    .mode-copy { background: var(--blue-dim); color: var(--blue); border: 1px solid rgba(96,165,250,0.3); }
+
+    .edit-stock-notice {
+      display: flex; align-items: flex-start; gap: 8px; margin-top: 8px;
+      padding: 10px 14px; border-radius: var(--radius-sm);
+      background: var(--amber-dim); color: var(--amber);
+      border: 1px solid rgba(251,191,36,0.3); font-size: 12px; line-height: 1.6;
+      strong { color: inherit; }
     }
 
     /* Stock section */
@@ -618,7 +752,6 @@ const STOCK_TYPES: BankTransactionType[] = ['STOCK_BUY', 'STOCK_SELL'];
       &.confirming { background: var(--red-dim); color: var(--red); border-color: rgba(248,113,113,0.4); animation: pulse-border 1s ease-in-out infinite; }
       &:disabled { opacity: 0.5; cursor: not-allowed; }
     }
-    .action-cell { width: 160px; text-align: right; padding-right: 12px !important; }
     .btn-delete {
       display: inline-flex; align-items: center; gap: 5px; padding: 4px 9px; border-radius: var(--radius-sm);
       font-size: 11px; font-weight: 600; border: 1px solid transparent; cursor: pointer;
@@ -627,7 +760,6 @@ const STOCK_TYPES: BankTransactionType[] = ['STOCK_BUY', 'STOCK_SELL'];
       &.confirming { background: var(--red-dim); color: var(--red); border-color: rgba(248,113,113,0.4); animation: pulse-border 1s ease-in-out infinite; }
       &:disabled { opacity: 0.5; cursor: not-allowed; }
     }
-    tr.deleting td { opacity: 0.4; transition: opacity 0.2s; }
     @keyframes pulse-border { 0%, 100% { border-color: rgba(248,113,113,0.4); } 50% { border-color: rgba(248,113,113,0.8); } }
 
     /* Toast */
@@ -637,7 +769,7 @@ const STOCK_TYPES: BankTransactionType[] = ['STOCK_BUY', 'STOCK_SELL'];
     @keyframes slideIn { from { opacity: 0; transform: translateY(8px); } to { opacity: 1; transform: translateY(0); } }
 
     .modal-lg { max-width: 620px; }
-  `]
+  `],
 })
 export class BankComponent implements OnInit {
   loading = signal(true);
@@ -655,6 +787,11 @@ export class BankComponent implements OnInit {
   confirmDeleteAccountId = signal<number | null>(null);
   deleteError = signal('');
   searchResults = signal<Security[]>([]);
+
+  /** The id of the transaction currently being edited (null if create/copy). */
+  editingTxId = signal<number | null>(null);
+  /** Which mode the tx modal is in. */
+  modalMode: ModalMode = 'create';
 
   // Modals
   showCreateModal = false;
@@ -683,12 +820,11 @@ export class BankComponent implements OnInit {
 
   newAccount: BankAccountCreate = { name: '', currency: 'KZT', balance: 0 };
   newTx: Partial<BankTransactionCreate> & { type: BankTransactionType } = {
-    type: 'INCOME', date: new Date().toISOString().split('T')[0], amount: 0
+    type: 'INCOME', date: new Date().toISOString().split('T')[0], amount: 0,
   };
   newRate = { rate_percent: 0, effective_from: new Date().toISOString().split('T')[0], notes: '' };
   fxForm = { date: new Date().toISOString().split('T')[0], usd_to_kzt: 0 };
 
-  // Transaction type groups for the pill selector
   txTypeGroups = [
     {
       label: 'Cash',
@@ -696,7 +832,7 @@ export class BankComponent implements OnInit {
         { value: 'INCOME' as BankTransactionType, label: 'Income' },
         { value: 'EXPENSE' as BankTransactionType, label: 'Expense' },
         { value: 'INTEREST' as BankTransactionType, label: 'Interest' },
-      ]
+      ],
     },
     {
       label: 'Transfers',
@@ -704,14 +840,14 @@ export class BankComponent implements OnInit {
         { value: 'TRANSFER_IN' as BankTransactionType, label: 'Transfer In' },
         { value: 'TRANSFER_OUT' as BankTransactionType, label: 'Transfer Out' },
         { value: 'EXCHANGE' as BankTransactionType, label: 'Exchange' },
-      ]
+      ],
     },
     {
       label: 'Stocks',
       types: [
         { value: 'STOCK_BUY' as BankTransactionType, label: 'Stock Buy' },
         { value: 'STOCK_SELL' as BankTransactionType, label: 'Stock Sell' },
-      ]
+      ],
     },
     {
       label: 'Other',
@@ -719,9 +855,11 @@ export class BankComponent implements OnInit {
         { value: 'DIVIDEND' as BankTransactionType, label: 'Dividend' },
         { value: 'TAX' as BankTransactionType, label: 'Tax' },
         { value: 'COMMISSION' as BankTransactionType, label: 'Commission' },
-      ]
+      ],
     },
   ];
+
+  // ── Derived ────────────────────────────────────────────────────────────────
 
   visibleAccounts = () =>
     this.settings().hide_inactive_bank_accounts
@@ -732,7 +870,6 @@ export class BankComponent implements OnInit {
   totalUsd = () => this.visibleAccounts().filter(a => a.currency === 'USD').reduce((s, a) => s + +a.balance, 0);
   totalUsdEquiv = () => this.totalUsd() + (this.totalKzt() / (this.fxRate() || 475));
   selectedAccount = () => this.accounts().find(a => a.id === this.selectedAccountId()) || null;
-
   isStockType = (type: string) => STOCK_TYPES.includes(type as BankTransactionType);
 
   stockAmountPreview = (): number | null => {
@@ -769,6 +906,8 @@ export class BankComponent implements OnInit {
     });
   }
 
+  // ── Account CRUD ───────────────────────────────────────────────────────────
+
   openCreateAccount(): void {
     this.newAccount = { name: '', currency: 'KZT', balance: 0 };
     this.modalError = '';
@@ -777,23 +916,116 @@ export class BankComponent implements OnInit {
 
   createAccount(): void {
     if (!this.newAccount.name) return;
-    this.modalLoading = true; this.modalError = '';
+    this.modalLoading = true;
+    this.modalError = '';
     this.api.createBankAccount(this.newAccount).subscribe({
-      next: (acc) => {
+      next: acc => {
         this.accounts.update(prev => [...prev, acc]);
-        this.showCreateModal = false; this.modalLoading = false;
+        this.showCreateModal = false;
+        this.modalLoading = false;
         this.selectAccount(acc);
       },
-      error: (e) => { this.modalError = e.error?.detail || 'Failed'; this.modalLoading = false; }
+      error: e => { this.modalError = e.error?.detail || 'Failed'; this.modalLoading = false; },
     });
   }
 
+  // ── Transaction modal — open helpers ──────────────────────────────────────
+
+  /** Open in CREATE mode for the given account. */
   openTxModal(acc: BankAccount): void {
+    this.modalMode = 'create';
+    this.editingTxId.set(null);
     this.txTargetAccount = acc;
     this.newTx = { type: 'INCOME', date: new Date().toISOString().split('T')[0], amount: 0 };
     this.clearSecurity();
     this.txError = '';
     this.showTxModal = true;
+  }
+
+  /**
+   * Open in EDIT mode pre-filled from an existing transaction.
+   * Only date / notes / fx_rate — and amount for non-stock types — are editable.
+   */
+  openEditModal(tx: BankTransaction): void {
+    const acc = this.selectedAccount();
+    if (!acc) return;
+
+    this.modalMode = 'edit';
+    this.editingTxId.set(tx.id);
+    this.txTargetAccount = acc;
+    this.txError = '';
+
+    this.newTx = {
+      type: tx.type,
+      date: tx.date,
+      amount: tx.amount,
+      fx_rate: tx.fx_rate ?? undefined,
+      notes: tx.notes ?? '',
+      related_account_id: tx.related_account_id ?? undefined,
+      ticker: tx.ticker ?? undefined,
+      quantity: tx.quantity ?? undefined,
+      price_per_share: tx.price_per_share ?? undefined,
+      portfolio_id: tx.portfolio_id ?? undefined,
+    };
+
+    // For stock types, show a read-only security chip
+    if (tx.ticker) {
+      this.selectedSecurity = {
+        id: 0, ticker: tx.ticker, name: tx.ticker,
+        currency: 'USD', exchange: undefined, sector: undefined, industry: undefined,
+      };
+      this.tickerSearch = tx.ticker;
+    } else {
+      this.clearSecurity();
+    }
+
+    this.showTxModal = true;
+  }
+
+  /**
+   * Open in COPY mode: same fields as the source, but date reset to today
+   * and no editingTxId so it creates a new record.
+   */
+  openCopyModal(tx: BankTransaction): void {
+    const acc = this.selectedAccount();
+    if (!acc) return;
+
+    this.modalMode = 'copy';
+    this.editingTxId.set(null);
+    this.txTargetAccount = acc;
+    this.txError = '';
+
+    this.newTx = {
+      type: tx.type,
+      date: new Date().toISOString().split('T')[0],   // today
+      amount: tx.amount,
+      fx_rate: tx.fx_rate ?? undefined,
+      notes: tx.notes ?? '',
+      related_account_id: tx.related_account_id ?? undefined,
+      ticker: tx.ticker ?? undefined,
+      quantity: tx.quantity ?? undefined,
+      price_per_share: tx.price_per_share ?? undefined,
+      portfolio_id: tx.portfolio_id ?? undefined,
+    };
+
+    if (tx.ticker) {
+      this.selectedSecurity = {
+        id: 0, ticker: tx.ticker, name: tx.ticker,
+        currency: 'USD', exchange: undefined, sector: undefined, industry: undefined,
+      };
+      this.tickerSearch = tx.ticker;
+    } else {
+      this.clearSecurity();
+    }
+
+    this.showTxModal = true;
+  }
+
+  closeTxModal(): void {
+    this.showTxModal = false;
+    this.modalMode = 'create';
+    this.editingTxId.set(null);
+    this.txError = '';
   }
 
   selectTxType(type: BankTransactionType): void {
@@ -823,7 +1055,7 @@ export class BankComponent implements OnInit {
       this.searchLoading = true;
       this.api.searchSecurities(q).subscribe({
         next: r => { this.searchResults.set(r); this.searchLoading = false; },
-        error: () => this.searchLoading = false,
+        error: () => { this.searchLoading = false; },
       });
     }, 250);
   }
@@ -852,7 +1084,7 @@ export class BankComponent implements OnInit {
     });
   }
 
-  // ── Cross-currency transfer helpers ───────────────────────────────────────
+  // ── Cross-currency transfer ───────────────────────────────────────────────
 
   isCrossCurrencyTransfer(): boolean {
     if (!this.txTargetAccount) return false;
@@ -863,9 +1095,17 @@ export class BankComponent implements OnInit {
     return !!related && related.currency !== this.txTargetAccount.currency;
   }
 
-  // ── Add transaction ───────────────────────────────────────────────────────
+  // ── Modal submit (dispatches to create or update) ────────────────────────
 
-  addTransaction(): void {
+  submitTxModal(): void {
+    if (this.modalMode === 'edit' && this.editingTxId()) {
+      this.updateExistingTransaction();
+    } else {
+      this.createNewTransaction();
+    }
+  }
+
+  private createNewTransaction(): void {
     if (!this.txTargetAccount) return;
     this.txError = '';
 
@@ -881,7 +1121,7 @@ export class BankComponent implements OnInit {
       // Auto-calculate amount from qty × price
       const qty = +this.newTx.quantity;
       const price = +this.newTx.price_per_share;
-      this.newTx.amount = this.newTx.type === 'STOCK_BUY' ? -(qty * price) : (qty * price);
+      this.newTx.amount = this.newTx.type === 'STOCK_BUY' ? -(qty * price) : qty * price;
     }
 
     if ((this.newTx.type === 'TRANSFER_IN' || this.newTx.type === 'TRANSFER_OUT') && !this.newTx.related_account_id) {
@@ -911,7 +1151,8 @@ export class BankComponent implements OnInit {
 
     this.api.addBankTransaction(postedToAccountId, payload).subscribe({
       next: () => {
-        this.showTxModal = false; this.txModalLoading = false;
+        this.closeTxModal();
+        this.txModalLoading = false;
         this.api.listBankAccounts().subscribe(accs => this.accounts.set(accs));
         const selectedId = this.selectedAccountId();
         const involved = selectedId === postedToAccountId || (isTransfer && selectedId === relatedAccountId);
@@ -919,7 +1160,41 @@ export class BankComponent implements OnInit {
           this.api.listBankTransactions(selectedId).subscribe(txs => this.selectedTxs.set(txs));
         }
       },
-      error: e => { this.txError = e.error?.detail || 'Failed to add transaction.'; this.txModalLoading = false; }
+      error: e => { this.txError = e.error?.detail || 'Failed to add transaction.'; this.txModalLoading = false; },
+    });
+  }
+
+  private updateExistingTransaction(): void {
+    const acc = this.selectedAccount();
+    const txId = this.editingTxId();
+    if (!acc || !txId) return;
+
+    this.txError = '';
+    this.txModalLoading = true;
+
+    const patch: BankTransactionUpdate = {
+      date: this.newTx.date,
+      fx_rate: this.newTx.fx_rate ?? undefined,
+      notes: this.newTx.notes ?? '',
+    };
+
+    // Only send amount for non-stock types (server also guards this)
+    if (!this.isStockType(this.newTx.type)) {
+      patch.amount = this.newTx.amount;
+    }
+
+    this.api.updateBankTransaction(acc.id, txId, patch).subscribe({
+      next: updated => {
+        // Replace the row in the list in-place so the table doesn't flicker
+        this.selectedTxs.update(list =>
+          list.map(t => t.id === updated.id ? updated : t),
+        );
+        // Refresh account balance (amount may have changed)
+        this.api.listBankAccounts().subscribe(accs => this.accounts.set(accs));
+        this.txModalLoading = false;
+        this.closeTxModal();
+      },
+      error: e => { this.txError = e.error?.detail || 'Failed to update transaction.'; this.txModalLoading = false; },
     });
   }
 
@@ -952,7 +1227,7 @@ export class BankComponent implements OnInit {
         this.deleteError.set(e.error?.detail || 'Failed to delete transaction.');
         this.deletingTxId.set(null);
         setTimeout(() => this.deleteError.set(''), 5000);
-      }
+      },
     });
   }
 
@@ -987,7 +1262,7 @@ export class BankComponent implements OnInit {
         this.deleteError.set(e.error?.detail || 'Failed to delete account.');
         this.deletingAccountId.set(null);
         setTimeout(() => this.deleteError.set(''), 5000);
-      }
+      },
     });
   }
 
@@ -1007,24 +1282,28 @@ export class BankComponent implements OnInit {
 
   setRate(): void {
     if (!this.rateTargetAccount) return;
-    this.rateLoading = true; this.rateError = '';
+    this.rateLoading = true;
+    this.rateError = '';
     this.api.setBankRate(this.rateTargetAccount.id, this.newRate).subscribe({
       next: () => {
-        this.showRateModal = false; this.rateLoading = false;
+        this.showRateModal = false;
+        this.rateLoading = false;
         this.api.listBankAccounts().subscribe(accs => this.accounts.set(accs));
       },
-      error: e => { this.rateError = e.error?.detail || 'Failed'; this.rateLoading = false; }
+      error: e => { this.rateError = e.error?.detail || 'Failed'; this.rateLoading = false; },
     });
   }
 
   setFxRate(): void {
-    this.fxLoading = true; this.fxError = '';
+    this.fxLoading = true;
+    this.fxError = '';
     this.api.setFxRate(this.fxForm).subscribe({
       next: () => {
         this.fxRate.set(this.fxForm.usd_to_kzt);
-        this.showFxModal = false; this.fxLoading = false;
+        this.showFxModal = false;
+        this.fxLoading = false;
       },
-      error: e => { this.fxError = e.error?.detail || 'Failed'; this.fxLoading = false; }
+      error: e => { this.fxError = e.error?.detail || 'Failed'; this.fxLoading = false; },
     });
   }
 

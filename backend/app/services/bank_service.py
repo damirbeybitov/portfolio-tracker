@@ -4,6 +4,9 @@ Bank Service
 Key change: STOCK_BUY / STOCK_SELL bank transactions now automatically
 create / delete the matching portfolio transaction so the bank account is
 the single source of truth for stock activity.
+
+update_transaction: allows editing date, notes, fx_rate for all types,
+and amount for non-stock types (reversing the delta on the account balance).
 """
 
 import logging
@@ -22,7 +25,7 @@ from app.models.transaction import Transaction, TransactionType
 from app.schemas.bank import (
     BankAccountCreate, BankAccountUpdate, BankAccountResponse,
     BankInterestRateCreate, BankInterestRateResponse,
-    BankTransactionCreate, BankTransactionResponse,
+    BankTransactionCreate, BankTransactionUpdate, BankTransactionResponse,
     FxRateCreate, FxRateResponse,
 )
 from app.schemas.portfolio import TransactionCreate
@@ -203,6 +206,85 @@ class BankService:
 
         await db.flush()
         await db.refresh(tx)
+        return BankTransactionResponse.model_validate(tx)
+
+    # ── Update transaction ────────────────────────────────────────────────────
+
+    @staticmethod
+    async def update_transaction(
+        db: AsyncSession,
+        user_id: int,
+        account_id: int,
+        transaction_id: int,
+        data: BankTransactionUpdate,
+    ) -> BankTransactionResponse:
+        """
+        Partially update a bank transaction.
+
+        - date / notes / fx_rate: always editable.
+        - amount: editable for non-stock types only.  The delta is applied to
+          the account's current balance (historical balance_after snapshots on
+          other rows are intentionally left as-is — they are display-only
+          artifacts; the live balance is the authoritative figure).
+        - STOCK_BUY / STOCK_SELL: changing the amount would require replaying
+          the linked portfolio position, which is too complex to do safely
+          here.  Guide the user to delete + re-add instead.
+        """
+        account = await BankService.get_account_or_404(db, user_id, account_id)
+
+        result = await db.execute(
+            select(BankTransaction).where(
+                and_(
+                    BankTransaction.id == transaction_id,
+                    BankTransaction.account_id == account_id,
+                )
+            )
+        )
+        tx = result.scalar_one_or_none()
+        if not tx:
+            raise HTTPException(status_code=404, detail="Transaction not found")
+
+        # Guard: stock amount changes not allowed
+        if data.amount is not None and tx.type in STOCK_TYPES:
+            raise HTTPException(
+                status_code=422,
+                detail=(
+                    "The amount of a stock transaction cannot be changed here because it is "
+                    "linked to a portfolio position.  Delete this transaction and re-add it "
+                    "with the correct amount."
+                ),
+            )
+
+        # Apply amount delta to live account balance
+        if data.amount is not None and data.amount != tx.amount:
+            delta = data.amount - tx.amount          # positive → more money in
+            new_balance = account.balance + delta
+            if new_balance < 0:
+                raise HTTPException(
+                    status_code=422,
+                    detail=(
+                        f"Editing this transaction would result in a negative balance "
+                        f"({new_balance:.2f}).  Adjust the amount or leave it unchanged."
+                    ),
+                )
+            account.balance = new_balance
+            tx.amount = data.amount
+            tx.balance_after = new_balance           # update this tx's snapshot
+
+        if data.date is not None:
+            tx.date = data.date
+        if data.fx_rate is not None:
+            tx.fx_rate = data.fx_rate
+        # Allow explicitly clearing notes by passing ""
+        if data.notes is not None:
+            tx.notes = data.notes or None
+
+        await db.flush()
+        await db.refresh(tx)
+        logger.info(
+            "Bank transaction updated",
+            extra={"account_id": account_id, "transaction_id": transaction_id},
+        )
         return BankTransactionResponse.model_validate(tx)
 
     @staticmethod

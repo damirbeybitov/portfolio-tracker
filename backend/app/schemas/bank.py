@@ -1,3 +1,4 @@
+from __future__ import annotations
 from pydantic import BaseModel, Field, model_validator
 from datetime import datetime, date
 from decimal import Decimal
@@ -78,6 +79,22 @@ class BankTransactionCreate(BaseModel):
                     f"Fields required for {self.type}: {', '.join(missing)}"
                 )
         return self
+
+
+class BankTransactionUpdate(BaseModel):
+    """
+    Partial update for a bank transaction.
+
+    Rules:
+    - `amount` may only be changed on non-stock transactions.  For
+      STOCK_BUY / STOCK_SELL the linked portfolio transaction would need to
+      be replayed as well — users should delete and re-add those instead.
+    - Omit any field you do not want to change (standard PATCH semantics).
+    """
+    date: Optional[date] = None
+    amount: Optional[Decimal] = None
+    fx_rate: Optional[Decimal] = None
+    notes: Optional[str] = None
 
 
 class BankTransactionResponse(BaseModel):

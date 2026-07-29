@@ -5,7 +5,7 @@ import {
   AuthResponse, TokenResponse, Portfolio, PortfolioSummary, Transaction, TransactionCreate,
   Security, PortfolioAnalytics, BankSummary, OverallSummary, CandlePoint,
   BankAccount, BankAccountCreate, BankInterestRate, BankTransaction, BankTransactionCreate,
-  FxRate, UserResponse, UserSettings, UserSettingsUpdate,
+  BankTransactionUpdate, FxRate, UserResponse, UserSettings, UserSettingsUpdate,
 } from '../models';
 
 const API = '/api/v1';
@@ -112,7 +112,10 @@ export class ApiService {
   getBankRates(accountId: number): Observable<BankInterestRate[]> {
     return this.http.get<BankInterestRate[]>(`${API}/bank/accounts/${accountId}/rates`);
   }
-  setBankRate(accountId: number, data: { rate_percent: number; effective_from: string; notes?: string }): Observable<BankInterestRate> {
+  setBankRate(
+    accountId: number,
+    data: { rate_percent: number; effective_from: string; notes?: string },
+  ): Observable<BankInterestRate> {
     return this.http.post<BankInterestRate>(`${API}/bank/accounts/${accountId}/rates`, data);
   }
 
@@ -124,6 +127,17 @@ export class ApiService {
   }
   addBankTransaction(accountId: number, data: BankTransactionCreate): Observable<BankTransaction> {
     return this.http.post<BankTransaction>(`${API}/bank/accounts/${accountId}/transactions`, data);
+  }
+  /** Partial update — only send the fields you want to change. */
+  updateBankTransaction(
+    accountId: number,
+    transactionId: number,
+    data: BankTransactionUpdate,
+  ): Observable<BankTransaction> {
+    return this.http.patch<BankTransaction>(
+      `${API}/bank/accounts/${accountId}/transactions/${transactionId}`,
+      data,
+    );
   }
   importBankTransactions(accountId: number, file: File): Observable<any> {
     const formData = new FormData();
