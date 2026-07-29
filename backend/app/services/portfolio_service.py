@@ -268,9 +268,6 @@ class PortfolioService:
                     pos.avg_cost_kzt = pos.avg_cost_kzt / tx.split_ratio
             return
 
-        if tx.type in (TransactionType.DIVIDEND, TransactionType.TAX, TransactionType.COMMISSION):
-            return
-
         if tx.type == TransactionType.BUY:
             cost_usd = tx.price_usd * tx.quantity + tx.commission_usd
             cost_kzt = tx.price_kzt * tx.quantity + tx.commission_kzt
